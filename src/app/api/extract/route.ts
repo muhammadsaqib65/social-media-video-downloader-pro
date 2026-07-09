@@ -1,70 +1,73 @@
 import { NextRequest, NextResponse } from "next/server";
-import { db } from "@/db";
-import { downloads } from "@/db/schema";
-import { detectPlatform, isValidUrl } from "@/lib/platform";
-import { extractVideo } from "@/lib/extractors";
 
 export const dynamic = "force-dynamic";
 
+// Detect platform from URL
+function detectPlatform(url: string): 'tiktok' | 'instagram' | 'youtube' | null {
+  const lowerUrl = url.toLowerCase();
+  
+  if (lowerUrl.includes('tiktok.com') || lowerUrl.includes('vm.tiktok')) {
+    return 'tiktok';
+  }
+  if (lowerUrl.includes('instagram.com') || lowerUrl.includes('dd.instagram')) {
+    return 'instagram';
+  }
+  if (lowerUrl.includes('youtube.com') || lowerUrl.includes('youtu.be')) {
+    return 'youtube';
+  }
+  
+  return null;
+}
+
+// Extract video info from URL
 export async function POST(request: NextRequest) {
   try {
     const body = await request.json();
-    const url = typeof body?.url === "string" ? body.url.trim() : "";
+    const { url } = body;
 
     if (!url) {
       return NextResponse.json({ error: "URL is required" }, { status: 400 });
     }
 
-    if (!isValidUrl(url)) {
-      return NextResponse.json({ error: "Invalid URL" }, { status: 400 });
-    }
-
     const platform = detectPlatform(url);
+
     if (!platform) {
-      return NextResponse.json(
-        {
-          error:
-            "Unsupported link. Paste a TikTok, Instagram, or YouTube video URL.",
-        },
-        { status: 400 }
-      );
+      return NextResponse.json({ 
+        error: "Unsupported platform. Please provide a TikTok, Instagram, or YouTube URL." 
+      }, { status: 400 });
     }
 
-    const video = await extractVideo(url, platform);
-
-    try {
-      await db.insert(downloads).values({
-        platform: video.platform,
-        url: video.sourceUrl,
-        title: video.title,
-        author: video.author,
-        thumbnail: video.thumbnail,
-        downloadUrl: video.downloadUrl,
-        fileName: video.fileName,
-        success: true,
-      });
-    } catch {
-      // Don't fail extraction if logging fails
-    }
-
+    // Return the detected platform and appropriate download endpoint
     return NextResponse.json({
       success: true,
-      ...video,
+      platform,
+      url,
+      downloadEndpoint: `/api/download/${platform}`,
+      infoEndpoint: `/api/download/${platform}?url=${encodeURIComponent(url)}`
     });
   } catch (error) {
-    const message =
-      error instanceof Error ? error.message : "Failed to extract video";
-    return NextResponse.json({ error: message }, { status: 500 });
+    console.error("Error extracting video info:", error);
+    return NextResponse.json({ error: "Failed to extract video info" }, { status: 500 });
   }
 }
 
+// GET - Check if URL is supported
 export async function GET(request: NextRequest) {
-  const url = request.nextUrl.searchParams.get("url") || "";
-  return POST(
-    new NextRequest(request.url, {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ url }),
-    })
-  );
+  const { searchParams } = new URL(request.url);
+  const url = searchParams.get("url");
+
+  if (!url) {
+    return NextResponse.json({ error: "URL parameter is required" }, { status: 400 });
+  }
+
+  const platform = detectPlatform(url);
+
+  return NextResponse.json({
+    success: true,
+    platform,
+    supported: platform !== null,
+    message: platform 
+      ? `This appears to be a ${platform} URL` 
+      : "This URL is not from a supported platform"
+  });
 }
