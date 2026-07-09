@@ -4,17 +4,18 @@ import { tmpdir } from "os";
 import { join } from "path";
 import { Readable } from "stream";
 import { pipeline } from "stream/promises";
-import { Innertube, UniversalCache } from "youtubei.js";
+import { Innertube, Platform, UniversalCache } from "youtubei.js";
 import ffmpegPath from "ffmpeg-static";
 import { sanitizeFileName } from "@/lib/platform";
 
 export type YouTubeQualityOption = {
-  label: string; // e.g. 1080p
+  label: string;
   height: number;
   itag: number;
   hasAudio: boolean;
   container: string;
   approxSize?: number;
+  client: string;
 };
 
 export type YouTubeExtracted = {
@@ -31,7 +32,37 @@ export type YouTubeExtracted = {
   selectedQuality: string;
 };
 
+type ClientName = "IOS" | "ANDROID" | "TV" | "MWEB" | "WEB";
+
+type ResolvedFormat = {
+  itag: number;
+  label: string;
+  height: number;
+  hasAudio: boolean;
+  hasVideo: boolean;
+  container: string;
+  approxSize?: number;
+  url: string;
+  client: ClientName;
+  mimeType?: string;
+};
+
+// Required by youtubei.js to decipher signatureCipher URLs
+Platform.shim.eval = async (data: { output: string }) => {
+  // eslint-disable-next-line no-new-func
+  return new Function(data.output)();
+};
+
 let innertubePromise: Promise<Innertube> | null = null;
+
+const STREAM_HEADERS: Record<string, string> = {
+  "User-Agent":
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36",
+  Accept: "*/*",
+  "Accept-Language": "en-US,en;q=0.9",
+  Origin: "https://www.youtube.com",
+  Referer: "https://www.youtube.com/",
+};
 
 export function extractYouTubeVideoId(url: string): string | null {
   try {
@@ -39,8 +70,7 @@ export function extractYouTubeVideoId(url: string): string | null {
     const host = parsed.hostname.replace(/^www\./, "");
 
     if (host === "youtu.be") {
-      const id = parsed.pathname.split("/").filter(Boolean)[0];
-      return id || null;
+      return parsed.pathname.split("/").filter(Boolean)[0] || null;
     }
 
     if (host.endsWith("youtube.com") || host.endsWith("youtube-nocookie.com")) {
@@ -69,9 +99,29 @@ export function extractYouTubeVideoId(url: string): string | null {
 
 async function getInnertube() {
   if (!innertubePromise) {
+    const cookie = process.env.YOUTUBE_COOKIE?.trim() || undefined;
+
     innertubePromise = Innertube.create({
       cache: new UniversalCache(false),
+      // On serverless, local session generation is often more reliable
       generate_session_locally: true,
+      retrieve_player: true,
+      lang: "en",
+      location: "US",
+      cookie,
+      fetch: async (input: RequestInfo | URL, init?: RequestInit) => {
+        const headers = new Headers(init?.headers || {});
+        if (!headers.has("User-Agent")) {
+          headers.set(
+            "User-Agent",
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/131.0.0.0 Safari/537.36"
+          );
+        }
+        if (!headers.has("Accept-Language")) {
+          headers.set("Accept-Language", "en-US,en;q=0.9");
+        }
+        return fetch(input, { ...init, headers });
+      },
     }).catch((error) => {
       innertubePromise = null;
       throw error;
@@ -83,7 +133,7 @@ async function getInnertube() {
 function parseHeight(label?: string | null, height?: number | null): number {
   if (typeof height === "number" && height > 0) return height;
   if (!label) return 0;
-  const match = label.match(/(\d{3,4})p/);
+  const match = String(label).match(/(\d{3,4})p/);
   return match ? Number(match[1]) : 0;
 }
 
@@ -94,97 +144,185 @@ function formatContainer(mimeType?: string | null): string {
   return "mp4";
 }
 
-function buildQualityOptions(info: any): YouTubeQualityOption[] {
-  const progressive = (info.streaming_data?.formats || []) as any[];
-  const adaptive = (info.streaming_data?.adaptive_formats || []) as any[];
+async function resolveFormatUrl(
+  format: any,
+  player: any
+): Promise<string | null> {
+  if (format?.url && typeof format.url === "string") {
+    return format.url;
+  }
 
-  const byLabel = new Map<string, YouTubeQualityOption>();
+  if (typeof format?.decipher === "function" && player) {
+    try {
+      const deciphered = await format.decipher(player);
+      if (typeof deciphered === "string" && deciphered.startsWith("http")) {
+        return deciphered;
+      }
+    } catch {
+      // ignore and try next strategy
+    }
+  }
 
-  // Prefer progressive (video+audio) when available (usually 360p)
-  for (const format of progressive) {
-    if (!format?.has_video) continue;
-    const label = format.quality_label || format.quality || `${format.height || 0}p`;
-    if (!label || label === "0p") continue;
-    const option: YouTubeQualityOption = {
+  return null;
+}
+
+async function collectResolvedFormats(
+  info: any,
+  client: ClientName,
+  player: any
+): Promise<ResolvedFormat[]> {
+  const progressive = (info?.streaming_data?.formats || []) as any[];
+  const adaptive = (info?.streaming_data?.adaptive_formats || []) as any[];
+  const all = [...progressive, ...adaptive];
+  const resolved: ResolvedFormat[] = [];
+
+  for (const format of all) {
+    if (!format?.has_video && !format?.has_audio) continue;
+
+    const url = await resolveFormatUrl(format, player);
+    if (!url) continue;
+
+    const label =
+      format.quality_label ||
+      format.quality ||
+      (format.height ? `${format.height}p` : format.has_audio ? "audio" : "unknown");
+
+    resolved.push({
+      itag: format.itag,
       label: String(label).replace(/\s+/g, ""),
       height: parseHeight(format.quality_label || format.quality, format.height),
-      itag: format.itag,
       hasAudio: Boolean(format.has_audio),
+      hasVideo: Boolean(format.has_video),
       container: formatContainer(format.mime_type),
       approxSize: format.content_length
         ? Number(format.content_length)
         : undefined,
-    };
-
-    const existing = byLabel.get(option.label);
-    if (!existing || (!existing.hasAudio && option.hasAudio)) {
-      byLabel.set(option.label, option);
-    }
+      url,
+      client,
+      mimeType: format.mime_type,
+    });
   }
 
-  // Adaptive video-only formats for higher resolutions
-  for (const format of adaptive) {
-    if (!format?.has_video || format?.has_audio) continue;
-    // Prefer mp4/avc for broader compatibility
-    const mime = String(format.mime_type || "");
-    if (!mime.includes("mp4") && !mime.includes("avc1") && !mime.includes("av01")) {
-      // still allow webm if no mp4 for that resolution
-    }
+  return resolved;
+}
 
-    const label = format.quality_label || `${format.height || 0}p`;
-    if (!label || label === "0p") continue;
-    const normalized = String(label).replace(/\s+/g, "");
-    const existing = byLabel.get(normalized);
+async function loadFormats(videoId: string): Promise<{
+  title: string;
+  author: string;
+  duration: number;
+  thumbnail: string;
+  formats: ResolvedFormat[];
+  player: any;
+}> {
+  const yt = await getInnertube();
+  const clients: ClientName[] = ["IOS", "TV", "MWEB", "ANDROID", "WEB"];
 
-    // Keep progressive (with audio) if already present for same label
-    if (existing?.hasAudio) continue;
+  let title = "YouTube Video";
+  let author = "YouTube";
+  let duration = 0;
+  let thumbnail = `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
+  const allFormats: ResolvedFormat[] = [];
+  const errors: string[] = [];
 
-    // Prefer mp4 over webm for the same height
-    if (existing) {
-      const existingIsMp4 = existing.container === "mp4";
-      const nextIsMp4 = formatContainer(mime) === "mp4";
-      if (existingIsMp4 && !nextIsMp4) continue;
-      if (existingIsMp4 === nextIsMp4 && (existing.approxSize || 0) >= Number(format.content_length || 0)) {
-        continue;
+  for (const client of clients) {
+    try {
+      const info = await yt.getBasicInfo(videoId, { client });
+      if (info?.basic_info?.title) {
+        title = info.basic_info.title;
+        author =
+          info.basic_info.author ||
+          info.basic_info.channel?.name ||
+          author;
+        duration = info.basic_info.duration || duration;
+        thumbnail =
+          info.basic_info.thumbnail?.[0]?.url ||
+          thumbnail;
       }
-    }
 
-    byLabel.set(normalized, {
-      label: normalized,
-      height: parseHeight(format.quality_label, format.height),
-      itag: format.itag,
-      hasAudio: false,
-      container: formatContainer(mime),
-      approxSize: format.content_length
-        ? Number(format.content_length)
-        : undefined,
-    });
+      const resolved = await collectResolvedFormats(
+        info,
+        client,
+        yt.session.player
+      );
+      allFormats.push(...resolved);
+
+      // If we already have several playable video qualities, stop early
+      const videoQualities = new Set(
+        allFormats.filter((f) => f.hasVideo).map((f) => f.label)
+      );
+      if (videoQualities.size >= 3) break;
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      errors.push(`${client}: ${message}`);
+    }
   }
 
-  return Array.from(byLabel.values()).sort((a, b) => b.height - a.height);
+  if (!allFormats.length) {
+    throw new Error(
+      `No downloadable YouTube qualities found for this video. ${
+        errors[0] ? `Details: ${errors[0]}` : "YouTube may be blocking this server IP (common on Vercel)."
+      }`
+    );
+  }
+
+  return {
+    title,
+    author,
+    duration,
+    thumbnail,
+    formats: allFormats,
+    player: yt.session.player,
+  };
 }
 
-function pickAudioFormat(info: any): any | null {
-  const adaptive = (info.streaming_data?.adaptive_formats || []) as any[];
-  const audioFormats = adaptive
-    .filter((f) => f?.has_audio && !f?.has_video && f?.url)
+function buildQualityOptions(formats: ResolvedFormat[]): YouTubeQualityOption[] {
+  const byLabel = new Map<string, YouTubeQualityOption & { score: number }>();
+
+  for (const format of formats) {
+    if (!format.hasVideo) continue;
+    if (!format.label || format.label === "0p" || format.label === "unknown") {
+      continue;
+    }
+
+    // Score: progressive with audio > mp4 > higher size > prefer IOS/TV clients
+    let score = 0;
+    if (format.hasAudio) score += 1000;
+    if (format.container === "mp4") score += 100;
+    if (format.mimeType?.includes("avc1")) score += 40;
+    if (format.client === "IOS") score += 30;
+    if (format.client === "TV" || format.client === "MWEB") score += 20;
+    score += Math.min(format.approxSize || 0, 50_000_000) / 1_000_000;
+
+    const existing = byLabel.get(format.label);
+    if (!existing || score > existing.score) {
+      byLabel.set(format.label, {
+        label: format.label,
+        height: format.height,
+        itag: format.itag,
+        hasAudio: format.hasAudio,
+        container: format.container,
+        approxSize: format.approxSize,
+        client: format.client,
+        score,
+      });
+    }
+  }
+
+  return Array.from(byLabel.values())
+    .map(({ score: _score, ...rest }) => rest)
+    .sort((a, b) => b.height - a.height || a.label.localeCompare(b.label));
+}
+
+function pickAudioFormat(formats: ResolvedFormat[]): ResolvedFormat | null {
+  const audios = formats
+    .filter((f) => f.hasAudio && !f.hasVideo)
     .sort((a, b) => {
-      const aMp4 = String(a.mime_type || "").includes("mp4") ? 1 : 0;
-      const bMp4 = String(b.mime_type || "").includes("mp4") ? 1 : 0;
+      const aMp4 = a.container === "mp4" ? 1 : 0;
+      const bMp4 = b.container === "mp4" ? 1 : 0;
       if (aMp4 !== bMp4) return bMp4 - aMp4;
-      return (b.bitrate || 0) - (a.bitrate || 0);
+      return (b.approxSize || 0) - (a.approxSize || 0);
     });
-  return audioFormats[0] || null;
-}
-
-function findFormatByItag(info: any, itag: number): any | null {
-  const progressive = (info.streaming_data?.formats || []) as any[];
-  const adaptive = (info.streaming_data?.adaptive_formats || []) as any[];
-  return (
-    progressive.find((f) => f.itag === itag) ||
-    adaptive.find((f) => f.itag === itag) ||
-    null
-  );
+  return audios[0] || null;
 }
 
 function findQualityOption(
@@ -195,9 +333,7 @@ function findQualityOption(
     throw new Error("No downloadable YouTube qualities found for this video");
   }
 
-  if (!quality || quality === "best") {
-    return qualities[0];
-  }
+  if (!quality || quality === "best") return qualities[0];
 
   const exact = qualities.find(
     (q) => q.label.toLowerCase() === quality.toLowerCase()
@@ -213,78 +349,106 @@ function findQualityOption(
   return qualities[0];
 }
 
-async function getBestInfo(videoId: string) {
-  const yt = await getInnertube();
+function findResolvedFormat(
+  formats: ResolvedFormat[],
+  option: YouTubeQualityOption
+): ResolvedFormat | null {
+  // Prefer exact itag + client match, then itag, then label
+  return (
+    formats.find(
+      (f) =>
+        f.itag === option.itag &&
+        f.client === option.client &&
+        f.hasVideo
+    ) ||
+    formats.find((f) => f.itag === option.itag && f.hasVideo) ||
+    formats.find(
+      (f) =>
+        f.label === option.label &&
+        f.hasVideo &&
+        f.hasAudio === option.hasAudio
+    ) ||
+    formats.find((f) => f.label === option.label && f.hasVideo) ||
+    null
+  );
+}
 
-  // IOS usually provides direct adaptive URLs; ANDROID often provides progressive 360p
-  let iosInfo: any = null;
-  let androidInfo: any = null;
+async function fetchMediaToFile(fileUrl: string, filePath: string) {
+  const response = await fetch(fileUrl, {
+    headers: STREAM_HEADERS,
+    redirect: "follow",
+  });
 
-  try {
-    iosInfo = await yt.getBasicInfo(videoId, { client: "IOS" });
-  } catch {
-    // ignore
+  if (!response.ok || !response.body) {
+    throw new Error(`Failed to fetch media stream (${response.status})`);
   }
 
-  try {
-    androidInfo = await yt.getBasicInfo(videoId, { client: "ANDROID" });
-  } catch {
-    // ignore
+  const nodeStream = Readable.fromWeb(response.body as any);
+  await pipeline(nodeStream, createWriteStream(filePath));
+
+  const stat = await fs.stat(filePath);
+  if (!stat.size) {
+    throw new Error("Downloaded media file is empty");
+  }
+}
+
+async function mergeWithFfmpeg(
+  videoPath: string,
+  audioPath: string,
+  outputPath: string
+) {
+  if (!ffmpegPath) {
+    throw new Error("ffmpeg binary is not available on this server");
   }
 
-  if (!iosInfo && !androidInfo) {
-    // last resort
-    const webInfo = await yt.getBasicInfo(videoId, { client: "WEB" });
-    return { yt, info: webInfo, client: "WEB" as const };
-  }
+  await new Promise<void>((resolve, reject) => {
+    const ff = spawn(
+      ffmpegPath as string,
+      [
+        "-y",
+        "-i",
+        videoPath,
+        "-i",
+        audioPath,
+        "-c",
+        "copy",
+        "-shortest",
+        "-movflags",
+        "+faststart",
+        outputPath,
+      ],
+      { stdio: ["ignore", "ignore", "pipe"] }
+    );
 
-  // Merge format lists: prefer IOS adaptive URLs + ANDROID progressive
-  if (iosInfo && androidInfo) {
-    const merged = {
-      ...iosInfo,
-      basic_info: iosInfo.basic_info || androidInfo.basic_info,
-      streaming_data: {
-        formats: [
-          ...(androidInfo.streaming_data?.formats || []),
-          ...(iosInfo.streaming_data?.formats || []),
-        ],
-        adaptive_formats: [
-          ...(iosInfo.streaming_data?.adaptive_formats || []),
-          ...(androidInfo.streaming_data?.adaptive_formats || []),
-        ],
-      },
-    };
-    return { yt, info: merged, client: "IOS" as const };
-  }
-
-  return {
-    yt,
-    info: iosInfo || androidInfo,
-    client: (iosInfo ? "IOS" : "ANDROID") as "IOS" | "ANDROID",
-  };
+    let stderr = "";
+    ff.stderr.on("data", (chunk) => {
+      stderr += chunk.toString();
+    });
+    ff.on("error", reject);
+    ff.on("close", (code) => {
+      if (code === 0) resolve();
+      else {
+        reject(
+          new Error(stderr.slice(-600) || `ffmpeg exited with code ${code}`)
+        );
+      }
+    });
+  });
 }
 
 export async function extractYouTube(url: string): Promise<YouTubeExtracted> {
   const videoId = extractYouTubeVideoId(url);
-  if (!videoId) {
-    throw new Error("Invalid YouTube URL");
+  if (!videoId) throw new Error("Invalid YouTube URL");
+
+  const { title, author, duration, thumbnail, formats } =
+    await loadFormats(videoId);
+
+  const qualities = buildQualityOptions(formats);
+  if (!qualities.length) {
+    throw new Error("No downloadable YouTube qualities found for this video");
   }
 
-  const { info } = await getBestInfo(videoId);
-
-  const title = info.basic_info?.title || "YouTube Video";
-  const author =
-    info.basic_info?.author ||
-    info.basic_info?.channel?.name ||
-    "YouTube";
-  const duration = info.basic_info?.duration || 0;
-  const thumbnail =
-    info.basic_info?.thumbnail?.[0]?.url ||
-    `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
-
-  const qualities = buildQualityOptions(info);
-  const selected = qualities[0]?.label || "best";
-
+  const selected = qualities[0].label;
   const sourceUrl = `https://www.youtube.com/watch?v=${videoId}`;
   const proxyDownloadUrl = `/api/download/youtube/file?url=${encodeURIComponent(
     sourceUrl
@@ -305,64 +469,6 @@ export async function extractYouTube(url: string): Promise<YouTubeExtracted> {
   };
 }
 
-async function downloadUrlToFile(
-  fileUrl: string,
-  filePath: string
-): Promise<void> {
-  const response = await fetch(fileUrl, {
-    headers: {
-      "User-Agent":
-        "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
-      Accept: "*/*",
-    },
-  });
-
-  if (!response.ok || !response.body) {
-    throw new Error(`Failed to fetch media stream (${response.status})`);
-  }
-
-  const nodeStream = Readable.fromWeb(response.body as any);
-  await pipeline(nodeStream, createWriteStream(filePath));
-}
-
-async function mergeWithFfmpeg(
-  videoPath: string,
-  audioPath: string,
-  outputPath: string
-): Promise<void> {
-  if (!ffmpegPath) {
-    throw new Error("ffmpeg binary is not available");
-  }
-
-  await new Promise<void>((resolve, reject) => {
-    const ff = spawn(
-      ffmpegPath as string,
-      [
-        "-y",
-        "-i",
-        videoPath,
-        "-i",
-        audioPath,
-        "-c",
-        "copy",
-        "-shortest",
-        outputPath,
-      ],
-      { stdio: ["ignore", "ignore", "pipe"] }
-    );
-
-    let stderr = "";
-    ff.stderr.on("data", (chunk) => {
-      stderr += chunk.toString();
-    });
-    ff.on("error", reject);
-    ff.on("close", (code) => {
-      if (code === 0) resolve();
-      else reject(new Error(stderr.slice(-500) || `ffmpeg exited with ${code}`));
-    });
-  });
-}
-
 export async function openYouTubeStream(
   url: string,
   quality?: string | null
@@ -374,75 +480,138 @@ export async function openYouTubeStream(
   qualityLabel: string;
 }> {
   const videoId = extractYouTubeVideoId(url);
-  if (!videoId) {
-    throw new Error("Invalid YouTube URL");
+  if (!videoId) throw new Error("Invalid YouTube URL");
+
+  const { title, formats } = await loadFormats(videoId);
+  const qualities = buildQualityOptions(formats);
+  const selected = findQualityOption(qualities, quality);
+  const videoFormat = findResolvedFormat(formats, selected);
+
+  if (!videoFormat) {
+    throw new Error(`Could not resolve stream for ${selected.label}`);
   }
 
-  const { info } = await getBestInfo(videoId);
-  const title = info.basic_info?.title || "YouTube Video";
-  const qualities = buildQualityOptions(info);
-  const selected = findQualityOption(qualities, quality);
   const fileName = `${sanitizeFileName(title)}_${selected.label}.mp4`;
 
-  // Progressive format already includes audio
-  if (selected.hasAudio) {
-    const format = findFormatByItag(info, selected.itag);
-    if (!format?.url) {
-      throw new Error(`No stream URL for ${selected.label}`);
-    }
-
-    const response = await fetch(format.url, {
-      headers: {
-        "User-Agent":
-          "com.google.ios.youtube/19.29.1 (iPhone16,2; U; CPU iOS 17_5_1 like Mac OS X;)",
-        Accept: "*/*",
-      },
+  // Prefer adaptive (IOS/TV) first — progressive googlevideo URLs often return 403 on cloud IPs
+  const videoCandidates = formats
+    .filter(
+      (f) =>
+        f.hasVideo &&
+        (f.itag === selected.itag ||
+          f.label === selected.label ||
+          f.height === selected.height)
+    )
+    .sort((a, b) => {
+      // Prefer clients that usually work on serverless
+      const rank = (c: string) =>
+        c === "IOS" ? 0 : c === "TV" ? 1 : c === "MWEB" ? 2 : c === "WEB" ? 3 : 4;
+      // Prefer video-only adaptive for high res reliability, then progressive
+      const typeRank = (f: ResolvedFormat) =>
+        f.hasAudio ? 1 : 0;
+      if (typeRank(a) !== typeRank(b)) return typeRank(a) - typeRank(b);
+      if (rank(a.client) !== rank(b.client)) return rank(a.client) - rank(b.client);
+      return (b.approxSize || 0) - (a.approxSize || 0);
     });
-    if (!response.ok || !response.body) {
-      throw new Error(`YouTube stream fetch failed (${response.status})`);
+
+  const progressiveCandidates = videoCandidates.filter((f) => f.hasAudio);
+  const adaptiveVideoCandidates = videoCandidates.filter((f) => !f.hasAudio);
+
+  // 1) Try progressive direct stream first only if available (fast path)
+  for (const candidate of progressiveCandidates) {
+    try {
+      const response = await fetch(candidate.url, {
+        headers: STREAM_HEADERS,
+        redirect: "follow",
+      });
+      if (!response.ok || !response.body) continue;
+
+      return {
+        stream: response.body as ReadableStream<Uint8Array>,
+        contentType: "video/mp4",
+        fileName: `${sanitizeFileName(title)}_${candidate.label}.mp4`,
+        title,
+        qualityLabel: candidate.label,
+      };
+    } catch {
+      // fall through to adaptive merge
     }
-
-    return {
-      stream: response.body as ReadableStream<Uint8Array>,
-      contentType: "video/mp4",
-      fileName,
-      title,
-      qualityLabel: selected.label,
-    };
   }
 
-  // Adaptive: download video + audio then mux with ffmpeg
-  const videoFormat = findFormatByItag(info, selected.itag);
-  const audioFormat = pickAudioFormat(info);
+  // 2) Adaptive video + audio merge (more reliable on Vercel when progressive is 403)
+  const audioCandidates = formats
+    .filter((f) => f.hasAudio && !f.hasVideo)
+    .sort((a, b) => {
+      const rank = (c: string) =>
+        c === "IOS" ? 0 : c === "TV" ? 1 : c === "MWEB" ? 2 : 3;
+      if (rank(a.client) !== rank(b.client)) return rank(a.client) - rank(b.client);
+      const aMp4 = a.container === "mp4" ? 1 : 0;
+      const bMp4 = b.container === "mp4" ? 1 : 0;
+      if (aMp4 !== bMp4) return bMp4 - aMp4;
+      return (b.approxSize || 0) - (a.approxSize || 0);
+    });
 
-  if (!videoFormat?.url) {
-    throw new Error(`No video stream for ${selected.label}`);
+  if (!adaptiveVideoCandidates.length) {
+    throw new Error(
+      `Failed to fetch media stream (403). Progressive streams blocked and no adaptive formats for ${selected.label}.`
+    );
   }
-  if (!audioFormat?.url) {
+  if (!audioCandidates.length) {
     throw new Error("No audio stream available for this video");
   }
 
   const workDir = await fs.mkdtemp(join(tmpdir(), "yt-dl-"));
-  const videoPath = join(workDir, "video.mp4");
-  const audioPath = join(workDir, "audio.m4a");
+  const videoPath = join(workDir, "video.bin");
+  const audioPath = join(workDir, "audio.bin");
   const outputPath = join(workDir, "output.mp4");
 
+  const cleanup = async () => {
+    try {
+      await fs.rm(workDir, { recursive: true, force: true });
+    } catch {
+      // ignore
+    }
+  };
+
   try {
-    await downloadUrlToFile(videoFormat.url, videoPath);
-    await downloadUrlToFile(audioFormat.url, audioPath);
+    let videoOk = false;
+    let lastVideoError = "unknown";
+    for (const candidate of adaptiveVideoCandidates) {
+      try {
+        await fetchMediaToFile(candidate.url, videoPath);
+        videoOk = true;
+        break;
+      } catch (error) {
+        lastVideoError =
+          error instanceof Error ? error.message : String(error);
+      }
+    }
+    if (!videoOk) {
+      throw new Error(
+        `Failed to fetch video stream for ${selected.label}. ${lastVideoError}`
+      );
+    }
+
+    let audioOk = false;
+    let lastAudioError = "unknown";
+    for (const candidate of audioCandidates) {
+      try {
+        await fetchMediaToFile(candidate.url, audioPath);
+        audioOk = true;
+        break;
+      } catch (error) {
+        lastAudioError =
+          error instanceof Error ? error.message : String(error);
+      }
+    }
+    if (!audioOk) {
+      throw new Error(`Failed to fetch audio stream. ${lastAudioError}`);
+    }
+
     await mergeWithFfmpeg(videoPath, audioPath, outputPath);
 
     const nodeStream = createReadStream(outputPath);
     const webStream = Readable.toWeb(nodeStream) as ReadableStream<Uint8Array>;
-
-    // Cleanup temp files after stream finishes
-    const cleanup = async () => {
-      try {
-        await fs.rm(workDir, { recursive: true, force: true });
-      } catch {
-        // ignore
-      }
-    };
 
     const stream = new ReadableStream<Uint8Array>({
       start(controller) {
@@ -479,11 +648,7 @@ export async function openYouTubeStream(
       qualityLabel: selected.label,
     };
   } catch (error) {
-    try {
-      await fs.rm(workDir, { recursive: true, force: true });
-    } catch {
-      // ignore
-    }
+    await cleanup();
     throw error;
   }
 }
