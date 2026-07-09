@@ -4,6 +4,15 @@ import { useEffect, useMemo, useState } from "react";
 
 type Platform = "tiktok" | "instagram" | "youtube" | "unknown";
 
+interface QualityOption {
+  label: string;
+  height: number;
+  itag: number;
+  hasAudio: boolean;
+  container: string;
+  approxSize?: number;
+}
+
 interface VideoInfo {
   platform: Platform;
   title: string;
@@ -13,6 +22,8 @@ interface VideoInfo {
   downloadUrl: string;
   sourceUrl?: string;
   fileName?: string;
+  qualities?: QualityOption[];
+  selectedQuality?: string;
 }
 
 interface HistoryItem {
@@ -51,11 +62,19 @@ function platformBadgeClass(platform: string) {
   return "bg-slate-500/15 text-slate-300 border-slate-500/30";
 }
 
+function formatBytes(bytes?: number) {
+  if (!bytes || bytes <= 0) return "";
+  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
+  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
+}
+
 export default function VideoDownloaderPage() {
   const [videoUrl, setVideoUrl] = useState("");
   const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
+  const [selectedQuality, setSelectedQuality] = useState("best");
   const [history, setHistory] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(false);
+  const [downloading, setDownloading] = useState(false);
   const [historyLoading, setHistoryLoading] = useState(true);
   const [error, setError] = useState("");
   const [installPrompt, setInstallPrompt] = useState(false);
@@ -102,6 +121,7 @@ export default function VideoDownloaderPage() {
     setLoading(true);
     setError("");
     setVideoInfo(null);
+    setSelectedQuality("best");
 
     try {
       const response = await fetch("/api/download", {
@@ -117,6 +137,9 @@ export default function VideoDownloaderPage() {
 
       setVideoInfo(data);
       setVideoUrl(url);
+      if (data.platform === "youtube") {
+        setSelectedQuality(data.selectedQuality || data.qualities?.[0]?.label || "best");
+      }
       await loadHistory();
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
@@ -129,9 +152,49 @@ export default function VideoDownloaderPage() {
     if (!videoInfo) return;
 
     try {
-      const target = videoInfo.downloadUrl || videoInfo.sourceUrl || videoUrl;
+      let target = videoInfo.downloadUrl || videoInfo.sourceUrl || videoUrl;
       if (!target) {
         setError("No download link available");
+        return;
+      }
+
+      // For YouTube, always go through our server proxy with chosen resolution
+      if (videoInfo.platform === "youtube") {
+        const source = videoInfo.sourceUrl || videoUrl;
+        const quality = selectedQuality || videoInfo.selectedQuality || "best";
+        target = `/api/download/youtube/file?url=${encodeURIComponent(
+          source
+        )}&quality=${encodeURIComponent(quality)}`;
+      }
+
+      // Same-origin proxy downloads: fetch as blob so the browser actually saves the file
+      if (target.startsWith("/api/")) {
+        setDownloading(true);
+        setError("");
+        const response = await fetch(target);
+        if (!response.ok) {
+          const data = await response.json().catch(() => ({}));
+          throw new Error(
+            (data as { error?: string }).error ||
+              `Download failed (${response.status})`
+          );
+        }
+        const blob = await response.blob();
+        const objectUrl = URL.createObjectURL(blob);
+        const a = document.createElement("a");
+        a.href = objectUrl;
+        const qualitySuffix =
+          videoInfo.platform === "youtube" && selectedQuality
+            ? `_${selectedQuality}`
+            : "";
+        a.download =
+          videoInfo.fileName?.replace(/\.mp4$/i, `${qualitySuffix}.mp4`) ||
+          `${videoInfo.title || "video"}${qualitySuffix}.mp4`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        URL.revokeObjectURL(objectUrl);
+        setDownloading(false);
         return;
       }
 
@@ -143,8 +206,9 @@ export default function VideoDownloaderPage() {
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
-    } catch {
-      setError("Failed to start download");
+    } catch (err) {
+      setDownloading(false);
+      setError(err instanceof Error ? err.message : "Failed to start download");
     }
   };
 
@@ -181,6 +245,7 @@ export default function VideoDownloaderPage() {
 
   const reuseHistoryItem = (item: HistoryItem) => {
     setVideoUrl(item.url);
+    setSelectedQuality("best");
     setVideoInfo({
       platform: (item.platform as Platform) || "unknown",
       title: item.title || "Saved video",
@@ -321,12 +386,56 @@ export default function VideoDownloaderPage() {
                   <h2 className="text-lg font-semibold text-white">{videoInfo.title}</h2>
                   <p className="mt-1 text-sm text-slate-400">By {videoInfo.author}</p>
 
+                  {videoInfo.platform === "youtube" &&
+                    Array.isArray(videoInfo.qualities) &&
+                    videoInfo.qualities.length > 0 && (
+                      <div className="mt-4">
+                        <label className="mb-2 block text-xs font-medium uppercase tracking-wide text-slate-400">
+                          Resolution
+                        </label>
+                        <div className="flex flex-wrap gap-2">
+                          {videoInfo.qualities.map((quality) => {
+                            const active = selectedQuality === quality.label;
+                            return (
+                              <button
+                                key={`${quality.label}-${quality.itag}`}
+                                type="button"
+                                onClick={() => setSelectedQuality(quality.label)}
+                                className={`rounded-xl border px-3 py-2 text-left text-xs transition ${
+                                  active
+                                    ? "border-cyan-400/60 bg-cyan-400/10 text-cyan-200"
+                                    : "border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500"
+                                }`}
+                              >
+                                <div className="font-semibold">{quality.label}</div>
+                                <div className="mt-0.5 text-[10px] opacity-70">
+                                  {quality.hasAudio ? "Video + Audio" : "Merged"}
+                                  {quality.approxSize
+                                    ? ` · ~${formatBytes(quality.approxSize)}`
+                                    : ""}
+                                </div>
+                              </button>
+                            );
+                          })}
+                        </div>
+                      </div>
+                    )}
+
                   <div className="mt-4 flex flex-col gap-2 sm:flex-row">
                     <button
                       onClick={downloadVideoFile}
-                      className="rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-slate-950 hover:bg-emerald-400"
+                      disabled={downloading}
+                      className="rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-slate-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
                     >
-                      Download Video
+                      {downloading
+                        ? `Downloading${
+                            videoInfo.platform === "youtube" && selectedQuality
+                              ? ` ${selectedQuality}`
+                              : ""
+                          }...`
+                        : videoInfo.platform === "youtube" && selectedQuality
+                          ? `Download ${selectedQuality}`
+                          : "Download Video"}
                     </button>
                     <button
                       onClick={handleShare}

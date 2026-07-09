@@ -1,7 +1,7 @@
 import { NextRequest, NextResponse } from "next/server";
 import { db } from "@/db";
 import { downloads } from "@/db/schema";
-import { extractVideo } from "@/lib/extractors";
+import { extractYouTube } from "@/lib/youtube";
 import { isValidUrl } from "@/lib/platform";
 
 export const dynamic = "force-dynamic";
@@ -12,25 +12,33 @@ export async function POST(request: NextRequest) {
     const url = typeof body?.url === "string" ? body.url.trim() : "";
 
     if (!url || !isValidUrl(url)) {
-      return NextResponse.json({ error: "Valid YouTube URL is required" }, { status: 400 });
+      return NextResponse.json(
+        { error: "Valid YouTube URL is required" },
+        { status: 400 }
+      );
     }
 
-    const video = await extractVideo(url, "youtube");
+    const video = await extractYouTube(url);
 
-    await db.insert(downloads).values({
-      platform: "youtube",
-      url: video.sourceUrl,
-      title: video.title,
-      author: video.author,
-      thumbnail: video.thumbnail,
-      downloadUrl: video.downloadUrl,
-      fileName: video.fileName,
-      success: true,
-    });
+    try {
+      await db.insert(downloads).values({
+        platform: "youtube",
+        url: video.sourceUrl,
+        title: video.title,
+        author: video.author,
+        thumbnail: video.thumbnail,
+        downloadUrl: video.downloadUrl,
+        fileName: video.fileName,
+        success: true,
+      });
+    } catch {
+      // ignore logging failures
+    }
 
     return NextResponse.json({ success: true, ...video });
   } catch (error) {
-    const message = error instanceof Error ? error.message : "YouTube download failed";
+    const message =
+      error instanceof Error ? error.message : "YouTube download failed";
     return NextResponse.json({ error: message }, { status: 500 });
   }
 }

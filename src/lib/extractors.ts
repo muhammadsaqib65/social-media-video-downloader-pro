@@ -1,6 +1,6 @@
-import ytdl from "ytdl-core";
 import type { Platform } from "@/lib/platform";
 import { sanitizeFileName } from "@/lib/platform";
+import { extractYouTube as extractYouTubeCore } from "@/lib/youtube";
 
 export type ExtractedVideo = {
   platform: Platform;
@@ -11,15 +11,17 @@ export type ExtractedVideo = {
   sourceUrl: string;
   downloadUrl: string;
   fileName: string;
+  videoId?: string;
+  qualities?: Array<{
+    label: string;
+    height: number;
+    itag: number;
+    hasAudio: boolean;
+    container: string;
+    approxSize?: number;
+  }>;
+  selectedQuality?: string;
 };
-
-function getAuthorName(author: unknown): string {
-  if (typeof author === "string") return author;
-  if (author && typeof author === "object" && "name" in author) {
-    return String((author as { name?: string }).name || "Unknown");
-  }
-  return "Unknown";
-}
 
 export async function extractTikTok(url: string): Promise<ExtractedVideo> {
   const oembedResponse = await fetch(
@@ -34,7 +36,9 @@ export async function extractTikTok(url: string): Promise<ExtractedVideo> {
   );
 
   if (!oembedResponse.ok) {
-    throw new Error("Could not fetch TikTok video info. Check the URL and try again.");
+    throw new Error(
+      "Could not fetch TikTok video info. Check the URL and try again."
+    );
   }
 
   const data = (await oembedResponse.json()) as {
@@ -52,14 +56,12 @@ export async function extractTikTok(url: string): Promise<ExtractedVideo> {
     thumbnail: data.thumbnail_url || "",
     duration: 0,
     sourceUrl: url,
-    // Direct stream URL is resolved by third-party providers; keep source for client download flow
     downloadUrl: url,
     fileName: `${sanitizeFileName(title)}.mp4`,
   };
 }
 
 export async function extractInstagram(url: string): Promise<ExtractedVideo> {
-  // Prefer oEmbed when available; fall back to minimal metadata if blocked
   try {
     const oembedResponse = await fetch(
       `https://api.instagram.com/oembed?url=${encodeURIComponent(url)}`,
@@ -113,42 +115,7 @@ export async function extractInstagram(url: string): Promise<ExtractedVideo> {
 }
 
 export async function extractYouTube(url: string): Promise<ExtractedVideo> {
-  if (!ytdl.validateURL(url)) {
-    throw new Error("Invalid YouTube URL");
-  }
-
-  const info = await ytdl.getInfo(url);
-  const title = info.videoDetails.title || "YouTube Video";
-  const videoId = info.videoDetails.videoId;
-  const duration = parseInt(info.videoDetails.lengthSeconds || "0", 10) || 0;
-  const author = getAuthorName(info.videoDetails.author);
-  const thumbnail =
-    info.videoDetails.thumbnails?.[info.videoDetails.thumbnails.length - 1]?.url ||
-    `https://img.youtube.com/vi/${videoId}/hqdefault.jpg`;
-
-  let downloadUrl = `https://www.youtube.com/watch?v=${videoId}`;
-  try {
-    const format = ytdl.chooseFormat(info.formats, {
-      quality: "highest",
-      filter: "videoandaudio",
-    });
-    if (format?.url) {
-      downloadUrl = format.url;
-    }
-  } catch {
-    // keep watch URL as fallback
-  }
-
-  return {
-    platform: "youtube",
-    title,
-    author,
-    thumbnail,
-    duration,
-    sourceUrl: url,
-    downloadUrl,
-    fileName: `${sanitizeFileName(title)}.mp4`,
-  };
+  return extractYouTubeCore(url);
 }
 
 export async function extractVideo(

@@ -1,5 +1,5 @@
 import { NextRequest, NextResponse } from "next/server";
-import { extractVideo } from "@/lib/extractors";
+import { extractYouTube } from "@/lib/youtube";
 import { isValidUrl } from "@/lib/platform";
 
 export const dynamic = "force-dynamic";
@@ -12,7 +12,7 @@ export async function GET(request: NextRequest) {
   }
 
   try {
-    const video = await extractVideo(url, "youtube");
+    const video = await extractYouTube(url);
     return NextResponse.json({ success: true, ...video });
   } catch (error) {
     const message =
