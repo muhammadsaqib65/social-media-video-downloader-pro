@@ -135,10 +135,27 @@ export default function VideoDownloaderPage() {
         throw new Error(data.error || "Failed to process video");
       }
 
-      setVideoInfo(data);
+      const normalized: VideoInfo = {
+        platform: data.platform,
+        title: data.title || "Video",
+        author: data.author || "Unknown",
+        thumbnail: data.thumbnail || "",
+        duration: Number(data.duration || 0) || 0,
+        downloadUrl: data.downloadUrl || "",
+        sourceUrl: data.sourceUrl || url,
+        fileName: data.fileName || "video.mp4",
+        qualities: Array.isArray(data.qualities) ? data.qualities : [],
+        selectedQuality: data.selectedQuality,
+      };
+
+      setVideoInfo(normalized);
       setVideoUrl(url);
-      if (data.platform === "youtube") {
-        setSelectedQuality(data.selectedQuality || data.qualities?.[0]?.label || "best");
+      if (normalized.platform === "youtube") {
+        setSelectedQuality(
+          normalized.selectedQuality ||
+            normalized.qualities?.[0]?.label ||
+            "best"
+        );
       }
       await loadHistory();
     } catch (err) {
@@ -152,60 +169,75 @@ export default function VideoDownloaderPage() {
     if (!videoInfo) return;
 
     try {
-      let target = videoInfo.downloadUrl || videoInfo.sourceUrl || videoUrl;
-      if (!target) {
+      const source = videoInfo.sourceUrl || videoUrl;
+      if (!source) {
         setError("No download link available");
         return;
       }
 
-      // For YouTube, always go through our server proxy with chosen resolution
+      // Always proxy through our API so the browser downloads a real file
+      // instead of navigating to TikTok/Instagram/YouTube pages.
+      let target = "";
       if (videoInfo.platform === "youtube") {
-        const source = videoInfo.sourceUrl || videoUrl;
         const quality = selectedQuality || videoInfo.selectedQuality || "best";
         target = `/api/download/youtube/file?url=${encodeURIComponent(
           source
         )}&quality=${encodeURIComponent(quality)}`;
+      } else if (videoInfo.platform === "tiktok") {
+        target = `/api/download/tiktok/file?url=${encodeURIComponent(source)}`;
+      } else if (videoInfo.platform === "instagram") {
+        target = `/api/download/instagram/file?url=${encodeURIComponent(source)}`;
+      } else if (videoInfo.downloadUrl?.startsWith("/api/")) {
+        target = videoInfo.downloadUrl;
+      } else {
+        throw new Error("Unsupported platform for download");
       }
 
-      // Same-origin proxy downloads: fetch as blob so the browser actually saves the file
-      if (target.startsWith("/api/")) {
-        setDownloading(true);
-        setError("");
-        const response = await fetch(target);
-        if (!response.ok) {
-          const data = await response.json().catch(() => ({}));
-          throw new Error(
-            (data as { error?: string }).error ||
-              `Download failed (${response.status})`
-          );
-        }
-        const blob = await response.blob();
-        const objectUrl = URL.createObjectURL(blob);
-        const a = document.createElement("a");
-        a.href = objectUrl;
-        const qualitySuffix =
-          videoInfo.platform === "youtube" && selectedQuality
-            ? `_${selectedQuality}`
-            : "";
-        a.download =
-          videoInfo.fileName?.replace(/\.mp4$/i, `${qualitySuffix}.mp4`) ||
-          `${videoInfo.title || "video"}${qualitySuffix}.mp4`;
-        document.body.appendChild(a);
-        a.click();
-        document.body.removeChild(a);
-        URL.revokeObjectURL(objectUrl);
-        setDownloading(false);
-        return;
+      setDownloading(true);
+      setError("");
+
+      const response = await fetch(target);
+      const contentType = response.headers.get("content-type") || "";
+
+      if (!response.ok) {
+        const data = contentType.includes("application/json")
+          ? await response.json().catch(() => ({}))
+          : {};
+        throw new Error(
+          (data as { error?: string }).error ||
+            `Download failed (${response.status})`
+        );
       }
 
+      // Guard against APIs accidentally returning JSON/HTML
+      if (contentType.includes("application/json")) {
+        const data = await response.json().catch(() => ({}));
+        throw new Error(
+          (data as { error?: string }).error ||
+            "Server returned JSON instead of a video file"
+        );
+      }
+
+      const blob = await response.blob();
+      if (!blob || blob.size < 1000) {
+        throw new Error("Downloaded file is empty or invalid");
+      }
+
+      const objectUrl = URL.createObjectURL(blob);
       const a = document.createElement("a");
-      a.href = target;
-      a.target = "_blank";
-      a.rel = "noopener noreferrer";
-      a.download = videoInfo.fileName || `${videoInfo.title || "video"}.mp4`;
+      a.href = objectUrl;
+      const qualitySuffix =
+        videoInfo.platform === "youtube" && selectedQuality
+          ? `_${selectedQuality}`
+          : "";
+      a.download =
+        videoInfo.fileName?.replace(/\.mp4$/i, `${qualitySuffix}.mp4`) ||
+        `${videoInfo.title || "video"}${qualitySuffix}.mp4`;
       document.body.appendChild(a);
       a.click();
       document.body.removeChild(a);
+      URL.revokeObjectURL(objectUrl);
+      setDownloading(false);
     } catch (err) {
       setDownloading(false);
       setError(err instanceof Error ? err.message : "Failed to start download");
@@ -386,13 +418,13 @@ export default function VideoDownloaderPage() {
                   <h2 className="text-lg font-semibold text-white">{videoInfo.title}</h2>
                   <p className="mt-1 text-sm text-slate-400">By {videoInfo.author}</p>
 
-                  {videoInfo.platform === "youtube" &&
-                    Array.isArray(videoInfo.qualities) &&
-                    videoInfo.qualities.length > 0 && (
-                      <div className="mt-4">
-                        <label className="mb-2 block text-xs font-medium uppercase tracking-wide text-slate-400">
-                          Resolution
-                        </label>
+                  {videoInfo.platform === "youtube" && (
+                    <div className="mt-4">
+                      <label className="mb-2 block text-xs font-medium uppercase tracking-wide text-slate-400">
+                        Resolution
+                      </label>
+                      {Array.isArray(videoInfo.qualities) &&
+                      videoInfo.qualities.length > 0 ? (
                         <div className="flex flex-wrap gap-2">
                           {videoInfo.qualities.map((quality) => {
                             const active = selectedQuality === quality.label;
@@ -418,8 +450,14 @@ export default function VideoDownloaderPage() {
                             );
                           })}
                         </div>
-                      </div>
-                    )}
+                      ) : (
+                        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
+                          Resolutions unavailable for this video on the current
+                          server. You can still try Best quality download.
+                        </div>
+                      )}
+                    </div>
+                  )}
 
                   <div className="mt-4 flex flex-col gap-2 sm:flex-row">
                     <button
