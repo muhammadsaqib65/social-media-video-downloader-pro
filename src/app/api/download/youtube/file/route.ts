@@ -36,25 +36,14 @@ export async function GET(request: NextRequest) {
 
     const lower = message.toLowerCase();
     let status = 500;
-    let friendly = message;
 
-    if (lower.includes("403") || lower.includes("forbidden")) {
+    if (lower.includes("cookie")) status = 503;
+    else if (lower.includes("403") || lower.includes("forbidden") || lower.includes("blocked"))
       status = 403;
-      friendly =
-        "YouTube blocked the media stream (403). This is common on Vercel free/serverless IPs. Set YOUTUBE_COOKIE in Vercel env, or try again later / use a different video.";
-    } else if (lower.includes("410") || lower.includes("gone")) {
-      status = 410;
-      friendly =
-        "YouTube stream expired (410). Please try downloading again for a fresh link.";
-    } else if (
-      lower.includes("no downloadable") ||
-      lower.includes("no matching") ||
-      lower.includes("private") ||
-      lower.includes("unavailable")
-    ) {
+    else if (lower.includes("410") || lower.includes("gone")) status = 410;
+    else if (lower.includes("private") || lower.includes("unavailable") || lower.includes("no downloadable"))
       status = 404;
-    }
 
-    return NextResponse.json({ error: friendly }, { status });
+    return NextResponse.json({ error: message }, { status });
   }
 }

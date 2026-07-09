@@ -24,6 +24,7 @@ export type ExtractedVideo = {
     client?: string;
   }>;
   selectedQuality?: string;
+  warning?: string;
 };
 
 export async function extractTikTok(url: string): Promise<ExtractedVideo> {

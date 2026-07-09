@@ -32,6 +32,14 @@ export async function GET(request: NextRequest) {
       error instanceof Error
         ? error.message
         : "Failed to download Instagram video";
-    return NextResponse.json({ error: message }, { status: 500 });
+
+    const lower = message.toLowerCase();
+    const status = lower.includes("cookie")
+      ? 503
+      : lower.includes("private") || lower.includes("blocked")
+        ? 403
+        : 500;
+
+    return NextResponse.json({ error: message }, { status });
   }
 }
