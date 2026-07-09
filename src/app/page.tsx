@@ -1,261 +1,187 @@
 "use client";
 
-import { useEffect, useMemo, useRef, useState } from "react";
+import { useState, useEffect } from "react";
 
-type Platform = "tiktok" | "instagram" | "youtube" | "unknown";
-
-type BeforeInstallPromptEvent = Event & {
-  prompt: () => Promise<void>;
-  userChoice: Promise<{ outcome: "accepted" | "dismissed"; platform: string }>;
-};
-
-interface QualityOption {
-  label: string;
-  height: number;
+interface VideoFormat {
   itag: number;
-  hasAudio: boolean;
+  quality: string;
+  qualityLabel: string;
   container: string;
-  approxSize?: number;
+  hasVideo?: boolean;
+  hasAudio?: boolean;
+  contentLength?: string;
 }
 
 interface VideoInfo {
-  platform: Platform;
   title: string;
-  author: string;
+  downloadUrl: string;
   thumbnail: string;
   duration: number;
-  downloadUrl: string;
-  sourceUrl?: string;
-  fileName?: string;
-  qualities?: QualityOption[];
-  selectedQuality?: string;
-  warning?: string;
+  author: string;
+  videoId?: string;
+  formats?: VideoFormat[];
+  bestFormat?: VideoFormat;
+  requiresMerge?: boolean;
+  videoUrl?: string;
+  audioUrl?: string;
+  error?: string;
+  details?: string;
+  note?: string;
+  allFormats?: VideoFormat[];
 }
 
-interface HistoryItem {
+interface HistoryEntry {
   id: number;
   platform: string;
   url: string;
-  title: string | null;
-  author: string | null;
-  thumbnail: string | null;
-  downloadUrl: string | null;
-  createdAt: string | null;
+  fileName: string | null;
   success: boolean;
+  createdAt: string;
 }
 
-function detectPlatform(url: string): Platform {
-  const value = url.toLowerCase();
-  if (/tiktok\.com|vm\.tiktok\.com|vt\.tiktok\.com/.test(value)) return "tiktok";
-  if (/instagram\.com|instagr\.am/.test(value)) return "instagram";
-  if (/youtube\.com|youtu\.be|m\.youtube\.com|music\.youtube\.com/.test(value)) {
-    return "youtube";
-  }
-  return "unknown";
-}
-
-function platformLabel(platform: string) {
-  if (platform === "tiktok") return "TikTok";
-  if (platform === "instagram") return "Instagram";
-  if (platform === "youtube") return "YouTube";
-  return platform;
-}
-
-function platformBadgeClass(platform: string) {
-  if (platform === "tiktok") return "bg-pink-500/15 text-pink-300 border-pink-500/30";
-  if (platform === "instagram") return "bg-fuchsia-500/15 text-fuchsia-300 border-fuchsia-500/30";
-  if (platform === "youtube") return "bg-red-500/15 text-red-300 border-red-500/30";
-  return "bg-slate-500/15 text-slate-300 border-slate-500/30";
-}
-
-function formatBytes(bytes?: number) {
-  if (!bytes || bytes <= 0) return "";
-  if (bytes < 1024 * 1024) return `${Math.max(1, Math.round(bytes / 1024))} KB`;
-  return `${(bytes / (1024 * 1024)).toFixed(1)} MB`;
-}
-
-// Platforms with full server-side support vs limited support
-const PLATFORM_SUPPORT: Record<Platform, "full" | "limited"> = {
-  tiktok: "full",
-  instagram: "full",
-  youtube: "limited",
-  unknown: "full",
-};
-
-// External downloaders used as fallback when our server cannot fetch YouTube
-function getExternalDownloaderLinks(videoUrl: string): Array<{
-  name: string;
-  description: string;
-  href: string;
-}> {
-  const encoded = encodeURIComponent(videoUrl);
-  return [
-    {
-      name: "Cobalt",
-      description: "No ads, open source",
-      href: `https://cobalt.tools/`,
-    },
-    {
-      name: "SSYouTube",
-      description: "Add 'ss' before youtube.com",
-      href: videoUrl.replace(
-        /^(https?:\/\/)(?:www\.)?(youtube\.com|youtu\.be)/i,
-        "$1ss$2"
-      ),
-    },
-    {
-      name: "Y2Mate",
-      description: "Popular web converter",
-      href: `https://www.y2mate.com/youtube/${encoded}`,
-    },
-    {
-      name: "9xBuddy",
-      description: "Multi-quality selector",
-      href: `https://9xbuddy.com/process?url=${encoded}`,
-    },
-  ];
-}
+type Platform = 'tiktok' | 'instagram' | 'youtube';
 
 export default function VideoDownloaderPage() {
-  const [videoUrl, setVideoUrl] = useState("");
+  const [url, setUrl] = useState("");
+  const [activeTab, setActiveTab] = useState<Platform | "all">("all");
   const [videoInfo, setVideoInfo] = useState<VideoInfo | null>(null);
-  const [selectedQuality, setSelectedQuality] = useState("best");
-  const [history, setHistory] = useState<HistoryItem[]>([]);
   const [loading, setLoading] = useState(false);
   const [downloading, setDownloading] = useState(false);
-  const [historyLoading, setHistoryLoading] = useState(true);
   const [error, setError] = useState("");
-  const [showInstallHelp, setShowInstallHelp] = useState(false);
+  const [detectedPlatform, setDetectedPlatform] = useState<Platform | null>(null);
+  const [history, setHistory] = useState<HistoryEntry[]>([]);
+  const [showHistory, setShowHistory] = useState(false);
+  const [selectedQuality, setSelectedQuality] = useState<string>("best");
+  const [showQualityModal, setShowQualityModal] = useState(false);
+  const [deferredInstallPrompt, setDeferredInstallPrompt] = useState<any>(null);
   const [isInstalled, setIsInstalled] = useState(false);
-  const [canInstall, setCanInstall] = useState(false);
-  const [isIos, setIsIos] = useState(false);
-  const [igReady, setIgReady] = useState<boolean | null>(null);
-  const deferredInstallPrompt = useRef<BeforeInstallPromptEvent | null>(null);
+  const [installChecking, setInstallChecking] = useState(false);
 
-  const detectedPlatform = useMemo(() => detectPlatform(videoUrl), [videoUrl]);
+  // Detect platform from URL
+  useEffect(() => {
+    if (!url) {
+      setDetectedPlatform(null);
+      return;
+    }
 
-  const loadHistory = async () => {
+    const lowerUrl = url.toLowerCase();
+    if (lowerUrl.includes("tiktok.com") || lowerUrl.includes("vm.tiktok")) {
+      setDetectedPlatform("tiktok");
+    } else if (lowerUrl.includes("instagram.com") || lowerUrl.includes("dd.instagram")) {
+      setDetectedPlatform("instagram");
+    } else if (lowerUrl.includes("youtube.com") || lowerUrl.includes("youtu.be")) {
+      setDetectedPlatform("youtube");
+    } else {
+      setDetectedPlatform(null);
+    }
+  }, [url]);
+
+  // Fetch history
+  const fetchHistory = async () => {
     try {
-      setHistoryLoading(true);
       const response = await fetch("/api/history");
-      if (!response.ok) return;
       const data = await response.json();
-      setHistory(Array.isArray(data.history) ? data.history : []);
+      if (data.success) {
+        setHistory(data.history || []);
+      }
     } catch {
-      // ignore history load errors in UI
-    } finally {
-      setHistoryLoading(false);
+      // Silently fail for history
     }
   };
 
   useEffect(() => {
-    loadHistory();
-    fetch("/api/instagram/status")
-      .then((r) => r.json())
-      .then((d) => setIgReady(Boolean(d?.instagram?.ready)))
-      .catch(() => setIgReady(null));
-
-    if (typeof window === "undefined") return;
-
-    // Support shared links / PWA share_target: /?url=...
-    const params = new URLSearchParams(window.location.search);
-    const shared =
-      params.get("url") || params.get("text") || params.get("title") || "";
-    if (shared) {
-      // If share target sent text with a URL inside, extract first URL
-      const urlInText = shared.match(/https?:\/\/[^\s]+/i)?.[0] || shared;
-      if (/^https?:\/\//i.test(urlInText)) {
-        setVideoUrl(urlInText);
-      }
+    if (showHistory) {
+      fetchHistory();
     }
+  }, [showHistory]);
 
-    const ua = window.navigator.userAgent || "";
-    const ios =
-      /iPad|iPhone|iPod/.test(ua) ||
-      (navigator.platform === "MacIntel" && navigator.maxTouchPoints > 1);
-    setIsIos(ios);
+  // Register service worker
+  useEffect(() => {
+    if ("serviceWorker" in navigator) {
+      navigator.serviceWorker
+        .register("/sw.js", { scope: "/" })
+        .then((registration) => registration.update().catch(() => undefined))
+        .catch(() => undefined);
+    }
+  }, []);
 
-    const standalone =
-      window.matchMedia("(display-mode: standalone)").matches ||
-      // iOS Safari
-      Boolean((window.navigator as Navigator & { standalone?: boolean }).standalone);
+  // Check for deferred install prompt
+  useEffect(() => {
+    const standalone = window.matchMedia("(display-mode: standalone)").matches ||
+      (window.navigator as any).standalone === true;
     setIsInstalled(standalone);
 
-    if ("serviceWorker" in navigator) {
-      navigator.serviceWorker.register("/sw.js").catch(() => {});
-    }
-
-    const onBeforeInstallPrompt = (event: Event) => {
-      // Prevent Chrome mini-infobar; we use our Install button instead
-      event.preventDefault();
-      deferredInstallPrompt.current = event as BeforeInstallPromptEvent;
-      setCanInstall(true);
+    const handler = (e: Event) => {
+      e.preventDefault();
+      setDeferredInstallPrompt(e);
     };
 
-    const onAppInstalled = () => {
-      deferredInstallPrompt.current = null;
-      setCanInstall(false);
+    const installedHandler = () => {
       setIsInstalled(true);
-      setShowInstallHelp(false);
+      setDeferredInstallPrompt(null);
     };
 
-    window.addEventListener("beforeinstallprompt", onBeforeInstallPrompt);
-    window.addEventListener("appinstalled", onAppInstalled);
-
+    window.addEventListener("beforeinstallprompt", handler);
+    window.addEventListener("appinstalled", installedHandler);
     return () => {
-      window.removeEventListener("beforeinstallprompt", onBeforeInstallPrompt);
-      window.removeEventListener("appinstalled", onAppInstalled);
+      window.removeEventListener("beforeinstallprompt", handler);
+      window.removeEventListener("appinstalled", installedHandler);
     };
   }, []);
 
-  const processUrl = async (rawUrl?: string) => {
-    const url = (rawUrl ?? videoUrl).trim();
+  const getVideoInfo = async () => {
     if (!url) {
-      setError("Paste a TikTok, Instagram, or YouTube video link");
+      setError("Please enter a video URL");
+      return;
+    }
+
+    if (!detectedPlatform) {
+      setError("Please enter a valid TikTok or Instagram URL.");
+      return;
+    }
+
+    if (detectedPlatform === "youtube") {
+      setVideoInfo(null);
+      setError("YouTube is limited on Vercel and often blocks downloads. This app now focuses on TikTok and Instagram for reliable downloads.");
       return;
     }
 
     setLoading(true);
     setError("");
     setVideoInfo(null);
-    setSelectedQuality("best");
 
     try {
-      const response = await fetch("/api/download", {
+      const response = await fetch(`/api/download/${detectedPlatform}`, {
         method: "POST",
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({ url }),
       });
 
-      const data = await response.json();
       if (!response.ok) {
-        throw new Error(data.error || "Failed to process video");
+        const data = await response.json();
+        throw new Error(data.error || "Failed to fetch video info");
       }
 
-      const normalized: VideoInfo = {
-        platform: data.platform,
-        title: data.title || "Video",
-        author: data.author || "Unknown",
-        thumbnail: data.thumbnail || "",
-        duration: Number(data.duration || 0) || 0,
-        downloadUrl: data.downloadUrl || "",
-        sourceUrl: data.sourceUrl || url,
-        fileName: data.fileName || "video.mp4",
-        qualities: Array.isArray(data.qualities) ? data.qualities : [],
-        selectedQuality: data.selectedQuality,
-        warning: typeof data.warning === "string" ? data.warning : undefined,
-      };
-
-      setVideoInfo(normalized);
-      setVideoUrl(url);
-      if (normalized.platform === "youtube") {
-        setSelectedQuality(
-          normalized.selectedQuality ||
-            normalized.qualities?.[0]?.label ||
-            "best"
-        );
+      const data = await response.json();
+      
+      // Check if there's an error in the response
+      if (data.error) {
+        throw new Error(data.error);
       }
-      await loadHistory();
+      
+      setVideoInfo(data);
+
+      // Add to history
+      await fetch("/api/history", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          platform: detectedPlatform,
+          url,
+          fileName: data.title,
+          success: true,
+        }),
+      });
     } catch (err) {
       setError(err instanceof Error ? err.message : "Unknown error");
     } finally {
@@ -263,569 +189,555 @@ export default function VideoDownloaderPage() {
     }
   };
 
-  const downloadVideoFile = async () => {
-    if (!videoInfo) return;
+  const downloadVideo = async (quality?: string) => {
+    if (!videoInfo || !detectedPlatform) return;
 
+    setDownloading(true);
     try {
-      const source = videoInfo.sourceUrl || videoUrl;
-      if (!source) {
-        setError("No download link available");
+      let downloadUrl = `/api/download/${detectedPlatform}/video?url=${encodeURIComponent(url)}`;
+      
+      // Add quality/itag for YouTube
+      if (detectedPlatform === 'youtube' && quality && quality !== 'best') {
+        downloadUrl += `&itag=${quality}`;
+      }
+
+      const response = await fetch(downloadUrl);
+
+      // Check if response is JSON (error) or binary (file)
+      const contentType = response.headers.get('content-type') || '';
+      
+      if (contentType.includes('application/json')) {
+        // It's a JSON error response
+        const data = await response.json();
+        
+        if (data.error) {
+          if (data.error.includes("403") || data.error.includes("blocking") || data.error.includes("failed to fetch")) {
+            setError(`YouTube blocked the download. This is common for YouTube videos. Try TikTok or Instagram instead.`);
+          } else {
+            setError(data.error);
+          }
+        } else {
+          setError("Download not available for this video");
+        }
+        setDownloading(false);
         return;
       }
 
-      // Always proxy through our API so the browser downloads a real file
-      // instead of navigating to TikTok/Instagram/YouTube pages.
-      let target = "";
-      if (videoInfo.platform === "youtube") {
-        const quality = selectedQuality || videoInfo.selectedQuality || "best";
-        target = `/api/download/youtube/file?url=${encodeURIComponent(
-          source
-        )}&quality=${encodeURIComponent(quality)}`;
-      } else if (videoInfo.platform === "tiktok") {
-        target = `/api/download/tiktok/file?url=${encodeURIComponent(source)}`;
-      } else if (videoInfo.platform === "instagram") {
-        target = `/api/download/instagram/file?url=${encodeURIComponent(source)}`;
-      } else if (videoInfo.downloadUrl?.startsWith("/api/")) {
-        target = videoInfo.downloadUrl;
-      } else {
-        throw new Error("Unsupported platform for download");
+      // It's a binary file (video/image)
+      if (contentType.includes('video') || contentType.includes('image')) {
+        const blob = await response.blob();
+        const blobUrl = window.URL.createObjectURL(blob);
+        const extension = contentType.includes('video') ? 'mp4' : 'jpg';
+        const safeTitle = videoInfo.title.replace(/[^a-z0-9]/gi, '_').substring(0, 50);
+        
+        const a = document.createElement('a');
+        a.href = blobUrl;
+        a.download = `${safeTitle}.${extension}`;
+        document.body.appendChild(a);
+        a.click();
+        document.body.removeChild(a);
+        
+        // Clean up
+        setTimeout(() => window.URL.revokeObjectURL(blobUrl), 100);
+        setTimeout(() => setDownloading(false), 2000);
+        return;
       }
 
-      setDownloading(true);
-      setError("");
-
-      const response = await fetch(target);
-      const contentType = response.headers.get("content-type") || "";
-
-      if (!response.ok) {
-        const data = contentType.includes("application/json")
-          ? await response.json().catch(() => ({}))
-          : {};
-        throw new Error(
-          (data as { error?: string }).error ||
-            `Download failed (${response.status})`
-        );
-      }
-
-      // Guard against APIs accidentally returning JSON/HTML
-      if (contentType.includes("application/json")) {
-        const data = await response.json().catch(() => ({}));
-        throw new Error(
-          (data as { error?: string }).error ||
-            "Server returned JSON instead of a video file"
-        );
-      }
-
+      // Fallback: try to open the response as a URL
       const blob = await response.blob();
-      if (!blob || blob.size < 1000) {
-        throw new Error("Downloaded file is empty or invalid");
+      if (blob.size > 0) {
+        const blobUrl = window.URL.createObjectURL(blob);
+        window.open(blobUrl, '_blank');
+        setTimeout(() => setDownloading(false), 2000);
+        return;
       }
 
-      const objectUrl = URL.createObjectURL(blob);
-      const a = document.createElement("a");
-      a.href = objectUrl;
-      const qualitySuffix =
-        videoInfo.platform === "youtube" && selectedQuality
-          ? `_${selectedQuality}`
-          : "";
-      a.download =
-        videoInfo.fileName?.replace(/\.mp4$/i, `${qualitySuffix}.mp4`) ||
-        `${videoInfo.title || "video"}${qualitySuffix}.mp4`;
-      document.body.appendChild(a);
-      a.click();
-      document.body.removeChild(a);
-      URL.revokeObjectURL(objectUrl);
-      setDownloading(false);
+      setError("Download failed. Please try again.");
     } catch (err) {
+      console.error("Download error:", err);
+      setError("Failed to download video. Please try again.");
+    } finally {
       setDownloading(false);
-      setError(err instanceof Error ? err.message : "Failed to start download");
     }
   };
 
+  // Get unique qualities from formats
+  const getUniqueQualities = () => {
+    if (!videoInfo?.formats) return [];
+    const seen = new Set<string>();
+    return videoInfo.formats
+      .filter(f => f.hasVideo && f.hasAudio)
+      .map(f => ({
+        itag: f.itag.toString(),
+        quality: f.qualityLabel || f.quality,
+        container: f.container,
+        size: f.contentLength ? formatFileSize(parseInt(f.contentLength)) : 'Unknown'
+      }))
+      .filter(f => {
+        if (seen.has(f.quality)) return false;
+        seen.add(f.quality);
+        return true;
+      })
+      .sort((a, b) => {
+        const aRes = parseInt(a.quality.replace(/\D/g, '')) || 0;
+        const bRes = parseInt(b.quality.replace(/\D/g, '')) || 0;
+        return bRes - aRes;
+      });
+  };
+
+  const formatFileSize = (bytes: number) => {
+    if (bytes < 1024) return bytes + ' B';
+    if (bytes < 1024 * 1024) return (bytes / 1024).toFixed(1) + ' KB';
+    if (bytes < 1024 * 1024 * 1024) return (bytes / (1024 * 1024)).toFixed(1) + ' MB';
+    return (bytes / (1024 * 1024 * 1024)).toFixed(2) + ' GB';
+  };
+
   const handleShare = async () => {
-    if (!videoInfo) return;
+    if (!navigator.canShare) {
+      alert("Sharing not supported on this device");
+      return;
+    }
+
     try {
       await navigator.share({
-        title: videoInfo.title,
-        text: `Download this ${platformLabel(videoInfo.platform)} video without watermark`,
+        title: "Video Downloader Pro",
+        text: "Download videos from TikTok, Instagram & YouTube without watermark!",
         url: window.location.href,
       });
     } catch {
-      // user cancelled or share unsupported
+      // User cancelled or error
     }
   };
 
   const handleInstall = async () => {
-    // Already installed / running as app
     if (isInstalled) {
-      setShowInstallHelp(true);
+      alert("App is already installed on this device.");
       return;
     }
 
-    // Android/Chrome/Edge: native install prompt
-    if (deferredInstallPrompt.current) {
+    let promptEvent = deferredInstallPrompt;
+
+    if (!promptEvent) {
+      setInstallChecking(true);
       try {
-        await deferredInstallPrompt.current.prompt();
-        const choice = await deferredInstallPrompt.current.userChoice;
-        if (choice.outcome === "accepted") {
-          setIsInstalled(true);
-          setCanInstall(false);
-          deferredInstallPrompt.current = null;
-          setShowInstallHelp(false);
-          return;
+        if ("serviceWorker" in navigator) {
+          await navigator.serviceWorker.register("/sw.js", { scope: "/" });
+          await navigator.serviceWorker.ready;
         }
-      } catch {
-        // fall through to help instructions
+
+        await new Promise((resolve) => setTimeout(resolve, 1500));
+        promptEvent = deferredInstallPrompt;
+      } finally {
+        setInstallChecking(false);
       }
     }
 
-    // iOS / unsupported browsers: show install instructions (never open share menu)
-    setShowInstallHelp(true);
+    if (promptEvent) {
+      try {
+        await promptEvent.prompt();
+        const choice = await promptEvent.userChoice;
+        if (choice?.outcome === "accepted") {
+          setIsInstalled(true);
+        }
+        setDeferredInstallPrompt(null);
+        return;
+      } catch {
+        setDeferredInstallPrompt(null);
+      }
+    }
+
+    const isIos = /iphone|ipad|ipod/i.test(navigator.userAgent);
+    const isAndroid = /android/i.test(navigator.userAgent);
+
+    if (isIos) {
+      alert("iPhone install:\n\n1. Open this site in Safari\n2. Tap the Share button\n3. Tap 'Add to Home Screen'\n\niOS does not allow websites to open the install popup automatically.");
+      return;
+    }
+
+    if (isAndroid) {
+      alert("Android install:\n\nIf the popup did not appear, open this site in Chrome, wait 5 seconds, then tap browser menu (⋮) → 'Install app'.\n\nChrome only shows the install popup after it confirms the app is installable.");
+      return;
+    }
+
+    alert("Desktop install:\n\nUse Chrome/Edge and click the install icon in the address bar, or open browser menu → 'Install VideoDL'.");
   };
 
-  const reuseHistoryItem = (item: HistoryItem) => {
-    setVideoUrl(item.url);
-    setSelectedQuality("best");
-    setVideoInfo({
-      platform: (item.platform as Platform) || "unknown",
-      title: item.title || "Saved video",
-      author: item.author || "Unknown",
-      thumbnail: item.thumbnail || "",
-      duration: 0,
-      downloadUrl: item.downloadUrl || item.url,
-      sourceUrl: item.url,
-    });
+  const clearHistory = async () => {
+    try {
+      await fetch("/api/history?all=true", { method: "DELETE" });
+      setHistory([]);
+    } catch {
+      setError("Failed to clear history");
+    }
+  };
+
+  const formatDate = (dateStr: string) => {
+    const date = new Date(dateStr);
+    return date.toLocaleDateString() + " " + date.toLocaleTimeString();
+  };
+
+  const getPlatformIcon = (platform: string) => {
+    switch (platform) {
+      case "tiktok":
+        return "🎵";
+      case "instagram":
+        return "📸";
+      case "youtube":
+        return "▶️";
+      default:
+        return "🎬";
+    }
   };
 
   return (
-    <main className="min-h-screen px-4 py-8 sm:px-6">
-      {showInstallHelp && (
-        <div className="fixed inset-x-0 bottom-0 z-50 mx-auto w-full max-w-lg p-4">
-          <div className="rounded-3xl border border-violet-400/30 bg-slate-950/95 p-5 text-sm text-slate-100 shadow-2xl backdrop-blur">
-            <div className="mb-3 flex items-start justify-between gap-3">
-              <div>
-                <h3 className="text-base font-semibold text-white">
-                  {isInstalled ? "App already installed" : "Install Video Downloader"}
-                </h3>
-                <p className="mt-1 text-xs text-slate-400">
-                  {isInstalled
-                    ? "Open it from your home screen for the full app experience."
-                    : "Add this app to your phone home screen."}
-                </p>
-              </div>
-              <button
-                onClick={() => setShowInstallHelp(false)}
-                className="rounded-lg px-2 py-1 text-slate-400 hover:bg-slate-800 hover:text-white"
-                aria-label="Close"
-              >
-                ✕
-              </button>
-            </div>
-
-            {isIos ? (
-              <ol className="space-y-2 text-sm text-slate-200">
-                <li>
-                  1. Tap the <span className="font-semibold">Share</span> button in Safari
-                  (square with arrow)
-                </li>
-                <li>
-                  2. Scroll and tap{" "}
-                  <span className="font-semibold">Add to Home Screen</span>
-                </li>
-                <li>
-                  3. Tap <span className="font-semibold">Add</span>
-                </li>
-              </ol>
-            ) : canInstall ? (
-              <p className="text-sm text-slate-200">
-                Tap <span className="font-semibold">Install App</span> again to open the
-                system install popup.
-              </p>
-            ) : (
-              <ol className="space-y-2 text-sm text-slate-200">
-                <li>
-                  1. Open this site in <span className="font-semibold">Chrome</span>
-                </li>
-                <li>
-                  2. Tap the browser menu <span className="font-semibold">⋮</span>
-                </li>
-                <li>
-                  3. Choose <span className="font-semibold">Install app</span> or{" "}
-                  <span className="font-semibold">Add to Home screen</span>
-                </li>
-              </ol>
-            )}
-
+    <main className="min-h-screen bg-gray-950 text-gray-100">
+      {/* Header */}
+      <header className="border-b border-gray-800 bg-gray-900/80 backdrop-blur-sm sticky top-0 z-50">
+        <div className="max-w-2xl mx-auto px-4 py-4 flex items-center justify-between">
+          <h1 className="text-2xl font-bold bg-gradient-to-r from-violet-400 to-fuchsia-400 bg-clip-text text-transparent">
+            VideoDL Pro
+          </h1>
+          <div className="flex items-center gap-2">
             <button
-              onClick={() => setShowInstallHelp(false)}
-              className="mt-4 w-full rounded-xl bg-violet-600 px-4 py-2.5 text-sm font-semibold text-white hover:bg-violet-500"
+              onClick={() => setShowHistory(!showHistory)}
+              className="p-2 rounded-lg bg-gray-800 hover:bg-gray-700 transition-colors"
+              title="History"
             >
-              Got it
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4l3 3m6-3a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+            </button>
+            <button
+              onClick={handleInstall}
+              disabled={installChecking}
+              className={`px-4 py-2 rounded-lg font-medium transition-colors flex items-center gap-2 disabled:opacity-70 disabled:cursor-wait ${
+                isInstalled ? "bg-green-700 hover:bg-green-600" : "bg-violet-600 hover:bg-violet-500"
+              }`}
+              title={deferredInstallPrompt ? "Install app now" : "Install app"}
+            >
+              <svg className="w-4 h-4" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 18h.01M8 21h8a2 2 0 002-2V5a2 2 0 00-2-2H8a2 2 0 00-2 2v14a2 2 0 002 2z" />
+              </svg>
+              {isInstalled ? "Installed" : installChecking ? "Preparing..." : deferredInstallPrompt ? "Install App" : "Install App"}
             </button>
           </div>
         </div>
-      )}
+      </header>
 
-      <div className="mx-auto max-w-3xl">
-        <header className="mb-8 flex flex-col gap-4 sm:flex-row sm:items-center sm:justify-between">
-          <div>
-            <p className="mb-2 text-xs font-semibold uppercase tracking-[0.2em] text-cyan-300/80">
-              No watermark · Mobile ready
-            </p>
-            <h1 className="text-3xl font-bold tracking-tight text-white sm:text-4xl">
-              Video Downloader Pro
-            </h1>
-            <p className="mt-2 max-w-xl text-sm text-slate-400">
-              Paste any TikTok, Instagram, or YouTube link. TikTok and Instagram
-              are fully supported. YouTube is{" "}
-              <span className="font-medium text-amber-300">limited</span> on
-              Vercel — if our server is blocked, use the external tools below.
-            </p>
-          </div>
-          <button
-            onClick={handleInstall}
-            className="glow-button rounded-xl px-4 py-2.5 text-sm font-semibold text-white"
-          >
-            {isInstalled ? "✓ Installed" : "Install App"}
-          </button>
-        </header>
-
-        <section className="glass-card rounded-3xl p-5 sm:p-7">
-          <div className="mb-4 flex flex-wrap items-center gap-2">
-            {(["tiktok", "instagram", "youtube"] as const).map((platform) => {
-              const active = detectedPlatform === platform;
-              const support = PLATFORM_SUPPORT[platform];
-              return (
-                <span
-                  key={platform}
-                  className={`inline-flex items-center gap-1.5 rounded-full border px-3 py-1 text-xs font-medium ${
-                    active
-                      ? platformBadgeClass(platform)
-                      : "border-slate-700 text-slate-500"
-                  }`}
-                >
-                  {platformLabel(platform)}
-                  {support === "limited" && (
-                    <span
-                      className={`rounded-full px-1.5 py-0.5 text-[9px] font-bold uppercase tracking-wider ${
-                        active
-                          ? "bg-amber-500/20 text-amber-200"
-                          : "bg-slate-800 text-amber-400/80"
-                      }`}
-                    >
-                      Limited
-                    </span>
-                  )}
-                </span>
-              );
-            })}
-            {videoUrl && detectedPlatform === "unknown" && (
-              <span className="rounded-full border border-amber-500/30 bg-amber-500/10 px-3 py-1 text-xs text-amber-300">
-                Unsupported link
-              </span>
-            )}
-          </div>
-
-          <label className="mb-2 block text-sm font-medium text-slate-300">
-            Paste any video link
-          </label>
-
-          <div className="flex flex-col gap-3 sm:flex-row">
+      <div className="max-w-2xl mx-auto px-4 py-8">
+        {/* Combined Search Bar */}
+        <div className="mb-8">
+          <div className="relative">
             <input
               type="url"
-              value={videoUrl}
-              onChange={(e) => setVideoUrl(e.target.value)}
-              onKeyDown={(e) => {
-                if (e.key === "Enter") processUrl();
-              }}
-              placeholder="https://www.tiktok.com/... or Instagram / YouTube link"
-              className="w-full rounded-2xl border border-slate-700 bg-slate-950/70 px-4 py-3.5 text-slate-100 outline-none ring-violet-500/40 placeholder:text-slate-500 focus:border-violet-400 focus:ring-2"
+              value={url}
+              onChange={(e) => setUrl(e.target.value)}
+              placeholder="Paste TikTok video, Instagram Reel, or Instagram post URL here..."
+              className="w-full px-4 py-4 pr-12 bg-gray-900 border border-gray-700 rounded-xl text-white placeholder-gray-500 focus:ring-2 focus:ring-violet-500 focus:border-transparent outline-none transition-all"
+              onKeyDown={(e) => e.key === "Enter" && getVideoInfo()}
             />
             <button
-              onClick={() => processUrl()}
+              onClick={getVideoInfo}
               disabled={loading}
-              className="glow-button shrink-0 rounded-2xl px-6 py-3.5 font-semibold text-white"
+              className="absolute right-2 top-1/2 -translate-y-1/2 p-2 bg-violet-600 hover:bg-violet-500 rounded-lg disabled:opacity-50 transition-colors"
             >
-              {loading ? "Processing..." : "Download"}
+              {loading ? (
+                <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                  <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                  <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                </svg>
+              ) : (
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M21 21l-6-6m2-5a7 7 0 11-14 0 7 7 0 0114 0z" />
+                </svg>
+              )}
             </button>
           </div>
 
-          <p className="mt-3 text-xs text-slate-500">
-            Auto-detects the platform from the URL — no need to switch tabs.
-          </p>
-
-          {detectedPlatform === "youtube" && (
-            <div className="mt-3 flex items-start gap-2 rounded-xl border border-amber-500/25 bg-amber-500/5 px-3 py-2 text-xs text-amber-200/90">
-              <span className="mt-0.5 text-sm">⚠️</span>
-              <span>
-                YouTube is limited on Vercel because Google often blocks
-                serverless IPs. We still try — if it fails, use the external
-                tools that appear after loading the video.
-              </span>
+          {/* Platform Detection Indicator */}
+          {url && (
+            <div className="mt-3 flex items-center gap-2">
+              <span className="text-sm text-gray-400">Detected:</span>
+              {detectedPlatform ? (
+                <span className={`inline-flex items-center gap-1.5 px-3 py-1 rounded-full text-sm font-medium ${
+                  detectedPlatform === "tiktok" ? "bg-pink-900/50 text-pink-300" :
+                  detectedPlatform === "instagram" ? "bg-gradient-to-r from-purple-900/50 to-pink-900/50 text-pink-300" :
+                  "bg-red-900/50 text-red-300"
+                }`}>
+                  {getPlatformIcon(detectedPlatform)} {detectedPlatform.charAt(0).toUpperCase() + detectedPlatform.slice(1)}{detectedPlatform === "youtube" ? " • Limited" : ""}
+                </span>
+              ) : (
+                <span className="text-sm text-amber-400">⚠️ Unsupported URL</span>
+              )}
             </div>
           )}
+        </div>
 
-          {error && (
-            <div className="mt-4 rounded-2xl border border-red-500/30 bg-red-500/10 px-4 py-3 text-sm text-red-300">
-              {error}
+        {/* Quick Platform Tabs */}
+        <div className="flex gap-2 mb-6 overflow-x-auto pb-2">
+          {(["all", "tiktok", "instagram"] as const).map((tab) => (
+            <button
+              key={tab}
+              onClick={() => setActiveTab(tab)}
+              className={`px-4 py-2 rounded-lg font-medium whitespace-nowrap transition-all ${
+                activeTab === tab
+                  ? "bg-violet-600 text-white"
+                  : "bg-gray-800 text-gray-400 hover:bg-gray-700"
+              }`}
+            >
+              {tab === "all" ? "🌐 All" : `${getPlatformIcon(tab)} ${tab.charAt(0).toUpperCase() + tab.slice(1)}`}
+            </button>
+          ))}
+        </div>
+
+        {/* Error Message */}
+        {error && (
+          <div className="mb-6 p-4 bg-red-900/30 border border-red-800 rounded-xl text-red-300">
+            <div className="font-medium flex items-center gap-2">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M12 8v4m0 4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              Download Error
             </div>
-          )}
+            <p className="mt-2 text-sm">{error}</p>
+            {detectedPlatform === 'youtube' && (
+              <div className="mt-3 p-3 bg-amber-900/30 border border-amber-800 rounded-lg text-amber-300 text-xs">
+                <p className="font-medium mb-1">⚠️ YouTube Limited Support</p>
+                <p>This Vercel version is optimized for TikTok and Instagram. For YouTube, use your browser’s built-in save tools or a dedicated desktop downloader.</p>
+              </div>
+            )}
+          </div>
+        )}
 
-          {igReady === false && (
-            <div className="mt-4 rounded-2xl border border-pink-500/30 bg-pink-500/10 px-4 py-3 text-sm text-pink-100">
-              <p className="font-semibold text-pink-200">Instagram setup needed on Vercel</p>
-              <p className="mt-1 text-pink-100/90">
-                Add <span className="font-semibold">INSTAGRAM_COOKIE</span> in Vercel Environment
-                Variables, then redeploy. Copy the full cookie header from instagram.com while
-                logged in (DevTools → Network → cookie).
-              </p>
-            </div>
-          )}
-
-          {videoInfo?.warning && (
-            <div className="mt-4 rounded-2xl border border-amber-500/30 bg-amber-500/10 px-4 py-3 text-sm text-amber-200">
-              {videoInfo.warning}
-            </div>
-          )}
-
-          {videoInfo && (
-            <div className="mt-6 overflow-hidden rounded-2xl border border-slate-700/80 bg-slate-950/50">
-              <div className="grid gap-0 sm:grid-cols-[180px_1fr]">
-                <div className="min-h-40 bg-slate-900">
-                  {videoInfo.thumbnail ? (
-                    // eslint-disable-next-line @next/next/no-img-element
-                    <img
-                      src={videoInfo.thumbnail}
-                      alt={videoInfo.title}
-                      className="h-full w-full object-cover"
-                      onError={(e) => {
-                        (e.target as HTMLImageElement).style.display = "none";
-                      }}
-                    />
-                  ) : (
-                    <div className="flex h-full min-h-40 items-center justify-center text-slate-600">
-                      No preview
-                    </div>
-                  )}
-                </div>
-                <div className="p-4 sm:p-5">
-                  <div className="mb-2 flex flex-wrap items-center gap-2">
-                    <span
-                      className={`rounded-full border px-2.5 py-0.5 text-xs ${platformBadgeClass(
-                        videoInfo.platform
-                      )}`}
-                    >
-                      {platformLabel(videoInfo.platform)}
-                    </span>
-                    {videoInfo.duration > 0 && (
-                      <span className="text-xs text-slate-500">
-                        {Math.floor(videoInfo.duration / 60)}:
-                        {String(videoInfo.duration % 60).padStart(2, "0")}
-                      </span>
-                    )}
-                  </div>
-                  <h2 className="text-lg font-semibold text-white">{videoInfo.title}</h2>
-                  <p className="mt-1 text-sm text-slate-400">By {videoInfo.author}</p>
-
-                  {videoInfo.platform === "youtube" && (
-                    <div className="mt-4">
-                      <label className="mb-2 block text-xs font-medium uppercase tracking-wide text-slate-400">
-                        Resolution
-                      </label>
-                      {Array.isArray(videoInfo.qualities) &&
-                      videoInfo.qualities.length > 0 ? (
-                        <div className="flex flex-wrap gap-2">
-                          {videoInfo.qualities.map((quality) => {
-                            const active = selectedQuality === quality.label;
-                            return (
-                              <button
-                                key={`${quality.label}-${quality.itag}`}
-                                type="button"
-                                onClick={() => setSelectedQuality(quality.label)}
-                                className={`rounded-xl border px-3 py-2 text-left text-xs transition ${
-                                  active
-                                    ? "border-cyan-400/60 bg-cyan-400/10 text-cyan-200"
-                                    : "border-slate-700 bg-slate-900 text-slate-300 hover:border-slate-500"
-                                }`}
-                              >
-                                <div className="font-semibold">{quality.label}</div>
-                                <div className="mt-0.5 text-[10px] opacity-70">
-                                  {quality.hasAudio ? "Video + Audio" : "Merged"}
-                                  {quality.approxSize
-                                    ? ` · ~${formatBytes(quality.approxSize)}`
-                                    : ""}
-                                </div>
-                              </button>
-                            );
-                          })}
-                        </div>
-                      ) : (
-                        <div className="rounded-xl border border-amber-500/30 bg-amber-500/10 px-3 py-2 text-xs text-amber-200">
-                          Resolutions unavailable for this video on the current
-                          server. You can still try Best quality download.
-                        </div>
-                      )}
-                    </div>
-                  )}
-
-                  <div className="mt-4 flex flex-col gap-2 sm:flex-row">
-                    <button
-                      onClick={downloadVideoFile}
-                      disabled={downloading}
-                      className="rounded-xl bg-emerald-500 px-4 py-2.5 text-sm font-semibold text-slate-950 hover:bg-emerald-400 disabled:cursor-not-allowed disabled:opacity-60"
-                    >
-                      {downloading
-                        ? `Downloading${
-                            videoInfo.platform === "youtube" && selectedQuality
-                              ? ` ${selectedQuality}`
-                              : ""
-                          }...`
-                        : videoInfo.platform === "youtube" && selectedQuality
-                          ? `Download ${selectedQuality}`
-                          : "Download Video"}
-                    </button>
-                    <button
-                      onClick={handleShare}
-                      className="rounded-xl border border-slate-600 bg-slate-900 px-4 py-2.5 text-sm font-semibold text-slate-200 hover:border-slate-400"
-                    >
-                      Share
-                    </button>
-                  </div>
-
-                  {videoInfo.platform === "youtube" && (
-                    <div className="mt-4 rounded-xl border border-slate-700/70 bg-slate-900/60 p-3">
-                      <p className="mb-2 text-xs font-medium text-slate-300">
-                        If the download above fails, open this video in a trusted
-                        external tool:
-                      </p>
-                      <div className="grid grid-cols-2 gap-2 sm:grid-cols-4">
-                        {getExternalDownloaderLinks(
-                          videoInfo.sourceUrl || videoUrl
-                        ).map((tool) => (
-                          <a
-                            key={tool.name}
-                            href={tool.href}
-                            target="_blank"
-                            rel="noopener noreferrer"
-                            className="rounded-lg border border-slate-700 bg-slate-950/60 px-3 py-2 text-center transition hover:border-violet-500/60 hover:bg-slate-900"
-                          >
-                            <div className="text-xs font-semibold text-white">
-                              {tool.name}
-                            </div>
-                            <div className="mt-0.5 text-[10px] text-slate-500">
-                              {tool.description}
-                            </div>
-                          </a>
-                        ))}
-                      </div>
-                    </div>
-                  )}
-                </div>
+        {/* Video Info Card */}
+        {videoInfo && (
+          <div className="mb-8 p-5 bg-gray-900 border border-gray-800 rounded-2xl">
+            <div className="flex gap-4">
+              {videoInfo.thumbnail && (
+                <img
+                  src={videoInfo.thumbnail}
+                  alt={videoInfo.title}
+                  className="w-32 h-20 object-cover rounded-lg hidden sm:block"
+                  onError={(e) => { (e.target as HTMLImageElement).style.display = "none"; }}
+                />
+              )}
+              <div className="flex-1 min-w-0">
+                <h3 className="font-semibold text-white truncate">{videoInfo.title}</h3>
+                <p className="text-sm text-gray-400 mt-1">
+                  {getPlatformIcon(detectedPlatform || "")} {(detectedPlatform || "").charAt(0).toUpperCase() + (detectedPlatform || "").slice(1)} • {videoInfo.author}
+                </p>
+                {videoInfo.duration > 0 && (
+                  <p className="text-xs text-gray-500 mt-1">
+                    Duration: {Math.floor(videoInfo.duration / 60)}:{String(videoInfo.duration % 60).padStart(2, "0")}
+                  </p>
+                )}
               </div>
             </div>
-          )}
-        </section>
 
-        <section className="glass-card mt-6 rounded-3xl p-5 sm:p-7">
-          <div className="mb-4 flex items-center justify-between gap-3">
-            <h3 className="text-lg font-semibold text-white">Recent downloads</h3>
-            <button
-              onClick={loadHistory}
-              className="text-xs font-medium text-cyan-300 hover:text-cyan-200"
-            >
-              Refresh
-            </button>
-          </div>
+            {/* Quality Selection for YouTube */}
+            {detectedPlatform === 'youtube' && videoInfo.formats && videoInfo.formats.length > 0 && (
+              <div className="mt-4 p-3 bg-gray-800/50 rounded-lg">
+                <div className="flex items-center justify-between mb-2">
+                  <span className="text-sm text-gray-300 font-medium">Select Quality</span>
+                  <button
+                    onClick={() => setShowQualityModal(!showQualityModal)}
+                    className="text-xs text-violet-400 hover:text-violet-300 flex items-center gap-1"
+                  >
+                    {showQualityModal ? 'Hide' : 'Show'} Options
+                    <svg className={`w-3 h-3 transition-transform ${showQualityModal ? 'rotate-180' : ''}`} fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 9l-7 7-7-7" />
+                    </svg>
+                  </button>
+                </div>
 
-          {historyLoading ? (
-            <p className="text-sm text-slate-500">Loading history...</p>
-          ) : history.length === 0 ? (
-            <p className="text-sm text-slate-500">
-              No downloads yet. Paste a link above to get started.
-            </p>
-          ) : (
-            <div className="space-y-3">
-              {history.map((item) => (
-                <button
-                  key={item.id}
-                  onClick={() => reuseHistoryItem(item)}
-                  className="flex w-full items-start gap-3 rounded-2xl border border-slate-800 bg-slate-950/40 p-3 text-left transition hover:border-slate-600"
-                >
-                  <div className="h-14 w-14 shrink-0 overflow-hidden rounded-xl bg-slate-900">
-                    {item.thumbnail ? (
-                      // eslint-disable-next-line @next/next/no-img-element
-                      <img
-                        src={item.thumbnail}
-                        alt={item.title || "thumbnail"}
-                        className="h-full w-full object-cover"
-                      />
-                    ) : null}
-                  </div>
-                  <div className="min-w-0 flex-1">
-                    <div className="mb-1 flex items-center gap-2">
-                      <span
-                        className={`rounded-full border px-2 py-0.5 text-[10px] ${platformBadgeClass(
-                          item.platform
-                        )}`}
+                {/* Quality Grid */}
+                {showQualityModal && (
+                  <div className="mt-3 grid grid-cols-2 sm:grid-cols-3 gap-2 max-h-48 overflow-y-auto">
+                    {/* Best Quality Option */}
+                    <button
+                      onClick={() => { setSelectedQuality('best'); setShowQualityModal(false); }}
+                      className={`p-2 rounded-lg border text-left transition-all ${
+                        selectedQuality === 'best'
+                          ? 'border-violet-500 bg-violet-600/20'
+                          : 'border-gray-700 bg-gray-800 hover:border-gray-600'
+                      }`}
+                    >
+                      <div className="text-sm font-medium text-white">Best Quality</div>
+                      <div className="text-xs text-gray-400">Auto</div>
+                    </button>
+
+                    {/* Quality Options */}
+                    {getUniqueQualities().map((q) => (
+                      <button
+                        key={q.itag}
+                        onClick={() => { setSelectedQuality(q.itag); setShowQualityModal(false); }}
+                        className={`p-2 rounded-lg border text-left transition-all ${
+                          selectedQuality === q.itag
+                            ? 'border-violet-500 bg-violet-600/20'
+                            : 'border-gray-700 bg-gray-800 hover:border-gray-600'
+                        }`}
                       >
-                        {platformLabel(item.platform)}
-                      </span>
-                      {!item.success && (
-                        <span className="text-[10px] text-red-400">failed</span>
-                      )}
-                    </div>
-                    <p className="truncate text-sm font-medium text-slate-100">
-                      {item.title || item.url}
-                    </p>
-                    <p className="truncate text-xs text-slate-500">
-                      {item.author || "Unknown"} · {item.url}
-                    </p>
+                        <div className="text-sm font-medium text-white">{q.quality}</div>
+                        <div className="text-xs text-gray-400">{q.container.toUpperCase()} • {q.size}</div>
+                      </button>
+                    ))}
                   </div>
-                </button>
-              ))}
-            </div>
-          )}
-        </section>
+                )}
 
-        <section className="mt-6 grid gap-4 sm:grid-cols-2">
-          <div className="rounded-3xl border border-emerald-400/20 bg-emerald-400/5 p-5">
-            <h4 className="mb-2 font-semibold text-emerald-200">
-              ✅ Full support
+                {/* Selected Quality Indicator */}
+                {!showQualityModal && (
+                  <div className="mt-2 text-sm text-gray-300">
+                    Selected: <span className="text-violet-400 font-medium">
+                      {selectedQuality === 'best' ? 'Best Quality (Auto)' : 
+                        getUniqueQualities().find(q => q.itag === selectedQuality)?.quality || 'Best Quality'}
+                    </span>
+                  </div>
+                )}
+              </div>
+            )}
+
+            <div className="mt-4 flex gap-3">
+              <button
+                onClick={() => downloadVideo(selectedQuality)}
+                disabled={downloading}
+                className="flex-1 py-3 bg-green-600 hover:bg-green-500 disabled:bg-green-800 disabled:cursor-not-allowed text-white rounded-xl font-medium transition-colors flex items-center justify-center gap-2"
+              >
+                {downloading ? (
+                  <>
+                    <svg className="w-5 h-5 animate-spin" fill="none" viewBox="0 0 24 24">
+                      <circle className="opacity-25" cx="12" cy="12" r="10" stroke="currentColor" strokeWidth="4" />
+                      <path className="opacity-75" fill="currentColor" d="M4 12a8 8 0 018-8V0C5.373 0 0 5.373 0 12h4z" />
+                    </svg>
+                    Downloading...
+                  </>
+                ) : (
+                  <>
+                    <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                      <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 16v1a3 3 0 003 3h10a3 3 0 003-3v-1m-4-4l-4 4m0 0l-4-4m4 4V4" />
+                    </svg>
+                    Download {selectedQuality !== 'best' && `(${getUniqueQualities().find(q => q.itag === selectedQuality)?.quality || ''})`}
+                  </>
+                )}
+              </button>
+              <button
+                onClick={handleShare}
+                className="px-4 py-3 bg-gray-800 hover:bg-gray-700 rounded-xl transition-colors"
+                title="Share"
+              >
+                <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                  <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M8.684 13.342C8.886 12.938 9 12.482 9 12c0-.482-.114-.938-.316-1.342m0 2.684a3 3 0 110-2.684m0 2.684l6.632 3.316m-6.632-6l6.632-3.316m0 0a3 3 0 105.367-2.684 3 3 0 00-5.367 2.684zm0 9.316a3 3 0 105.368 2.684 3 3 0 00-5.368-2.684z" />
+                </svg>
+              </button>
+            </div>
+          </div>
+        )}
+
+        {/* Platform Support Notice */}
+        {detectedPlatform === 'youtube' && (
+          <div className="mb-6 p-4 bg-amber-900/20 border border-amber-700/50 rounded-xl">
+            <h4 className="text-amber-400 font-medium flex items-center gap-2 mb-2">
+              <svg className="w-5 h-5" fill="none" stroke="currentColor" viewBox="0 0 24 24">
+                <path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13 16h-1v-4h-1m1-4h.01M21 12a9 9 0 11-18 0 9 9 0 0118 0z" />
+              </svg>
+              YouTube is limited on Vercel
             </h4>
-            <ul className="space-y-1.5 text-sm text-emerald-100/80">
-              <li>• TikTok videos (no watermark)</li>
-              <li>• Instagram Reels and posts</li>
-              <li>• Direct download — no external tools needed</li>
-            </ul>
-            <p className="mt-3 text-xs text-emerald-200/70">
-              Tip: on Vercel add <code className="rounded bg-black/30 px-1">INSTAGRAM_COOKIE</code> for
-              best Instagram reliability.
+            <p className="text-sm text-amber-300/80">
+              YouTube frequently blocks Vercel/serverless IPs, so this app now focuses on reliable TikTok and Instagram downloads. Paste a TikTok video, Instagram Reel, or Instagram post link for best results.
             </p>
           </div>
+        )}
 
-          <div className="rounded-3xl border border-amber-400/20 bg-amber-400/5 p-5">
-            <h4 className="mb-2 font-semibold text-amber-200">
-              ⚠️ Limited support — YouTube
-            </h4>
-            <ul className="space-y-1.5 text-sm text-amber-100/80">
-              <li>• We try first, with multi-provider fallbacks</li>
-              <li>• If blocked, external tools appear automatically</li>
-              <li>• Optional: add <code className="rounded bg-black/30 px-1">YOUTUBE_COOKIE</code> in Vercel for full support</li>
-            </ul>
+        {/* Features */}
+        <div className="grid grid-cols-3 gap-3 mb-8">
+          {[
+            { icon: "🎵", title: "TikTok", desc: "Supported" },
+            { icon: "📸", title: "Instagram", desc: "Reels & Posts" },
+            { icon: "▶️", title: "YouTube", desc: "Limited on Vercel" },
+          ].map((feature, i) => (
+            <div key={i} className={`p-4 bg-gray-900 border border-gray-800 rounded-xl text-center ${
+              (feature.title === 'TikTok' && !detectedPlatform) || detectedPlatform === 'tiktok' ? 'border-green-600/50' : ''
+            } ${(feature.title === 'Instagram' && !detectedPlatform) || detectedPlatform === 'instagram' ? 'border-pink-600/50' : ''
+            } ${(feature.title === 'YouTube' && !detectedPlatform) || detectedPlatform === 'youtube' ? 'border-red-600/50' : ''}`}>
+              <div className="text-2xl mb-1">{feature.icon}</div>
+              <div className="text-sm font-medium text-white">{feature.title}</div>
+              <div className="text-xs text-gray-500">{feature.desc}</div>
+            </div>
+          ))}
+        </div>
+
+        {/* Instructions */}
+        <div className="p-5 bg-gray-900 border border-gray-800 rounded-xl">
+          <h3 className="font-semibold text-white mb-3 flex items-center gap-2">
+            📖 How to Use
+          </h3>
+          <ol className="space-y-2 text-sm text-gray-400">
+            <li className="flex gap-3">
+              <span className="flex-shrink-0 w-6 h-6 bg-violet-600 rounded-full flex items-center justify-center text-white text-xs font-bold">1</span>
+              <span>Copy a TikTok video, Instagram Reel, or Instagram post URL</span>
+            </li>
+            <li className="flex gap-3">
+              <span className="flex-shrink-0 w-6 h-6 bg-violet-600 rounded-full flex items-center justify-center text-white text-xs font-bold">2</span>
+              <span>Paste it in the search box above</span>
+            </li>
+            <li className="flex gap-3">
+              <span className="flex-shrink-0 w-6 h-6 bg-violet-600 rounded-full flex items-center justify-center text-white text-xs font-bold">3</span>
+              <span>Tap Download to save without watermark</span>
+            </li>
+          </ol>
+        </div>
+
+        {/* History Panel */}
+        {showHistory && (
+          <div className="mt-8 p-5 bg-gray-900 border border-gray-800 rounded-xl">
+            <div className="flex items-center justify-between mb-4">
+              <h3 className="font-semibold text-white">Download History</h3>
+              <div className="flex gap-2">
+                <button
+                  onClick={fetchHistory}
+                  className="text-sm text-violet-400 hover:text-violet-300"
+                >
+                  Refresh
+                </button>
+                <button
+                  onClick={clearHistory}
+                  className="text-sm text-red-400 hover:text-red-300"
+                >
+                  Clear All
+                </button>
+              </div>
+            </div>
+
+            {history.length === 0 ? (
+              <p className="text-gray-500 text-sm text-center py-4">No download history yet</p>
+            ) : (
+              <div className="space-y-2 max-h-64 overflow-y-auto">
+                {history.map((entry) => (
+                  <div
+                    key={entry.id}
+                    className="flex items-center gap-3 p-3 bg-gray-800/50 rounded-lg"
+                  >
+                    <span className="text-lg">{getPlatformIcon(entry.platform)}</span>
+                    <div className="flex-1 min-w-0">
+                      <p className="text-sm text-white truncate">{entry.fileName || entry.url}</p>
+                      <p className="text-xs text-gray-500">{formatDate(entry.createdAt)}</p>
+                    </div>
+                    <span className={`text-xs px-2 py-1 rounded ${
+                      entry.success ? "bg-green-900/50 text-green-300" : "bg-red-900/50 text-red-300"
+                    }`}>
+                      {entry.success ? "✓" : "✗"}
+                    </span>
+                  </div>
+                ))}
+              </div>
+            )}
           </div>
-        </section>
-
-        <section className="mt-4 rounded-3xl border border-slate-700/60 bg-slate-900/40 p-5">
-          <h4 className="mb-2 font-semibold text-slate-100">
-            📱 Install as a mobile app
-          </h4>
-          <ul className="space-y-1.5 text-sm text-slate-300">
-            <li>• Tap the <span className="font-semibold">Install App</span> button above</li>
-            <li>• Or share a TikTok / Instagram / YouTube link into this app</li>
-            <li>• On iPhone use Safari → Share → Add to Home Screen</li>
-          </ul>
-        </section>
+        )}
       </div>
+
+      {/* Footer */}
+      <footer className="mt-12 py-6 border-t border-gray-800 text-center text-gray-500 text-sm">
+        <p>Video Downloader Pro • Download responsibly</p>
+      </footer>
     </main>
   );
 }
